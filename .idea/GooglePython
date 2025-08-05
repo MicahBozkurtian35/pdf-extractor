@@ -1,0 +1,205 @@
+import os
+import io
+from pdf2image import convert_from_path
+from PIL import Image, ImageEnhance, ImageDraw
+import pandas as pd
+import openpyxl
+import google.generativeai as genai
+import uuid
+import re
+import base64
+
+# --- Helper Functions ---
+
+def authenticate_google_cloud(key_path=r"C:\API\api_key.txt"):
+    """Authenticates with Google Cloud using a service account key."""
+    try:
+        print(f"Trying to open api key at {key_path}")
+        with open(key_path, 'r') as file:
+            api_key = file.read().strip()
+            print(f"API KEY IS: {api_key}")
+            genai.configure(api_key=api_key)
+            print("Successfully authenticated")
+            return genai
+    except Exception as e:
+        print("Error authenticating with Google API Key")
+        print(f"Exception is {e}")
+        return None
+
+
+def pdf_to_pngs(pdf_path, output_dir="temp_images"):
+    """Extracts only graph images from a PDF and saves them to the output folder."""
+    os.makedirs(output_dir, exist_ok=True)
+    poppler_path = r"C:\poppler\poppler-24.08.0\Library\bin"  # <--- Absolute path to poppler
+
+    images = convert_from_path(pdf_path, poppler_path=poppler_path) #load the pdf as a list of images
+    image_paths = [] #list of the paths of extracted graph images
+    img_count = 0
+
+    for i, image in enumerate(images): #iterate through each of the images/pages in the pdf
+        width, height = image.size
+        # Define some minimum size for the bounding box of graph images
+        min_graph_width = 200
+        min_graph_height = 100
+        # Detect bounding boxes and filter based on those bounding boxes
+        box = images[i].getbbox() #<------- Here
+
+
+        if box:  # check if a bounding box exists
+            x0, y0, x1, y1 = box #<------ Here
+            if x1 - x0 > min_graph_width and y1 - y0 > min_graph_height: # filter out small objects, that are likely noise, but keep ones that are of a particular size
+                # We've identified a bounding box that is large enough, now extract and save it
+                graph_image = images[i].crop(box)
+                image_path = os.path.join(output_dir, f"chart_{img_count}.png")
+                graph_image.save(image_path, "PNG")
+                image_paths.append(image_path)
+                img_count += 1
+                print(f"Extracted graph image saved to {image_path}")
+
+    return image_paths
+
+def enhance_image(image_path, output_dir="enhanced_images"):
+    """Adds gridlines and zooms in on the image to make it easier to process"""
+
+    os.makedirs(output_dir, exist_ok=True)
+    try:
+        img = Image.open(image_path)
+        width, height = img.size
+        # Zoom in a little bit
+        zoom_factor = 1.2
+        new_width = int(width * zoom_factor)
+        new_height = int(height * zoom_factor)
+        img = img.resize((new_width, new_height), Image.LANCZOS)
+
+        width, height = img.size
+
+        # Draw grid lines
+        draw = ImageDraw.Draw(img)
+        grid_spacing = 25
+        for x in range(0, width, grid_spacing):
+            draw.line([(x, 0), (x, height)], fill='grey')
+        for y in range(0, height, grid_spacing):
+            draw.line([(0, y), (width, y)], fill='grey')
+
+        # Save enhanced image
+        filename = os.path.basename(image_path)
+        output_path = os.path.join(output_dir, filename)
+        img.save(output_path, "PNG")
+        return output_path
+    except Exception as e:
+        print(f"Error enhancing image at {image_path}: {e}")
+        return None
+
+def extract_data_with_ai(image_path, genai_client, model_name="gemini-pro"):
+    """Extracts tabular data from an image using Google Gemini API."""
+    try:
+        model = genai_client.GenerativeModel(model_name)
+        with open(image_path, "rb") as f:
+            image_data = f.read()
+
+        base64_encoded_image = base64.b64encode(image_data).decode("utf-8")
+
+        prompt = f"""
+        Please analyze this image and identify the bar graph and extract the numerical values of each bar, please present the result as a CSV file with the following headers: "Team", "Value"
+        Here is the image: {base64_encoded_image}
+        """
+        response = model.generate_content(prompt)
+
+        if response.text:
+            return response.text
+        elif response.prompt_feedback:
+            print(response.prompt_feedback)
+            return None
+    except Exception as e:
+        print(f"Error generating content with AI on {image_path}: {e}")
+        return None
+
+def convert_csv_to_dataframe(csv_text):
+    """Converts the CSV text to pandas dataframe, returns a dataframe"""
+    try:
+        csv_text = csv_text.strip()
+        csv_text = re.sub(r'[^\x00-\x7F]+', '', csv_text)
+        df = pd.read_csv(io.StringIO(csv_text))
+        return df
+    except Exception as e:
+        print(f"Error converting text to CSV: {e}")
+        return None
+
+
+def create_excel_tab_with_data(dataframe, excel_writer, tab_name):
+    """Creates a tab with data and chart in an Excel file."""
+    try:
+        # Write DataFrame to Excel
+        dataframe.to_excel(excel_writer, sheet_name=tab_name, index=False,startrow=2)
+
+        # Get the range of data
+        max_row = len(dataframe.index) + 2
+        max_col = len(dataframe.columns)
+
+        # Create a chart
+        workbook  = excel_writer.book
+        worksheet = excel_writer.sheets[tab_name]
+        chart = openpyxl.chart.BarChart()
+        chart.type = "col"
+        chart.title = tab_name
+        chart.x_axis.title = dataframe.columns[0]  # Set x-axis title from column headers
+        chart.y_axis.title = "Value"
+
+
+        data_range = openpyxl.chart.Reference(worksheet, min_col=2, min_row=3, max_col=max_col, max_row=max_row)
+        categories = openpyxl.chart.Reference(worksheet, min_col=1, min_row=3, max_col=1, max_row=max_row)
+        chart.add_data(data_range, titles_from_data=False)
+        chart.set_categories(categories)
+
+        worksheet.add_chart(chart, "A" + str(max_row+3)) #position chart
+
+    except Exception as e:
+        print(f"Error creating tab {tab_name} in Excel: {e}")
+
+
+def compare_charts(original_image, generated_chart_image):
+    """Compares the original chart to the generated chart and provides a comparison metric"""
+    # This function is for quality control, but is left empty here to help keep the script simple
+
+def process_pdf_to_excel(pdf_path, excel_output_path):
+    """Main function to process PDF and create the Excel output."""
+    try:
+        genai_client = authenticate_google_cloud()
+        if not genai_client:
+            print("Could not authenticate to Google AI Studio")
+            return
+
+        temp_images = pdf_to_pngs(pdf_path)
+
+        excel_writer = pd.ExcelWriter(excel_output_path, engine="openpyxl")
+
+        for image_path in temp_images:
+            print(f"Processing {image_path}")
+            # Enhance the image and prepare for better data extraction
+            enhanced_image_path = enhance_image(image_path)
+
+            # Get the extracted text from the model
+            extracted_text = extract_data_with_ai(enhanced_image_path, genai_client)
+            if extracted_text: #check if the extracted_text is not none
+                # Convert the text to pandas dataframe
+                dataframe = convert_csv_to_dataframe(extracted_text)
+                if dataframe is not None:
+                    tab_name = os.path.splitext(os.path.basename(image_path))[0] # get file name without extension
+                    create_excel_tab_with_data(dataframe, excel_writer, tab_name)
+            else:
+                print(f"Could not extract data from AI for {enhanced_image_path}")
+                continue
+
+        excel_writer.close()
+        print(f"Created Excel file at {excel_output_path}")
+        os.rmdir("temp_images")
+        os.rmdir("enhanced_images")
+    except Exception as e:
+        print(f"Error generating Excel File from PDF {pdf_path}: {e}")
+# --- Main Execution ---
+
+if __name__ == "__main__":
+    pdf_file_path = r"C:\Users\Mbomm\IdeaProjects\PDF Graph Scanner\input_pdfs\Sample1.pdf"  # <-- Add the absolute path to the PDF here
+    excel_file_path = "output.xlsx"
+
+    process_pdf_to_excel(pdf_file_path, excel_file_path)
