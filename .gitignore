@@ -17,3 +17,5 @@ build/
 # Logs & temp
 *.log
 *.tmp
+"api_key.json" 
+"api_key.txt" 
