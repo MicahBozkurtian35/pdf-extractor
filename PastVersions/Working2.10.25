@@ -23,11 +23,8 @@ def debug_print(*args, **kwargs):
     if DEBUG:
         print(*args, **kwargs)
 
-#############################################
-# Basic Functions
-#############################################
-
 def read_anthropic_key(file_path=r"C:\API\anthropic_key.txt"):
+    """Reads the Anthropic API key from a text file and returns it."""
     try:
         with open(file_path, "r") as f:
             api_key = f.read().strip()
@@ -37,6 +34,10 @@ def read_anthropic_key(file_path=r"C:\API\anthropic_key.txt"):
         return None
 
 def crop_graph_opencv(pil_image, margin=10, extra_margin_ratio=0.5):
+    """
+    Crops ONLY the graph portion from an image using OpenCV edge detection
+    and contour analysis, then expands the bounding box to include nearby labels.
+    """
     cv_image = np.array(pil_image)
     if cv_image.shape[-1] == 4:
         cv_image = cv2.cvtColor(cv_image, cv2.COLOR_RGBA2RGB)
@@ -60,9 +61,14 @@ def crop_graph_opencv(pil_image, margin=10, extra_margin_ratio=0.5):
     x_end = min(x + w + 2 * extra_w, img_width)
     y_end = min(y + h + 2 * extra_h, img_height)
     cropped_cv = cv_image[y:y_end, x:x_end]
-    return Image.fromarray(cropped_cv)
+    cropped_pil = Image.fromarray(cropped_cv)
+    return cropped_pil
 
 def pdf_to_pngs(pdf_path, output_dir="temp_images"):
+    """
+    Extracts graph images from a PDF and saves them to the output folder.
+    (No cropping is performed here so that the raw image is available.)
+    """
     os.makedirs(output_dir, exist_ok=True)
     poppler_path = r"C:\poppler\poppler-24.08.0\Library\bin"
     images = convert_from_path(pdf_path, poppler_path=poppler_path)
@@ -75,6 +81,14 @@ def pdf_to_pngs(pdf_path, output_dir="temp_images"):
     return image_paths
 
 def extract_data_with_claude(image_path, api_key):
+    """
+    Extracts structured data from a chart image using Claude 3 Sonnet.
+    The prompt instructs Claude to:
+      - Return the CSV data.
+      - Provide a ChartType line (e.g. "ChartType: Bar").
+      - Provide a YAxis line with details in the format:
+          YAxis: <label>, <min>, <max>, <tick>
+    """
     try:
         client = anthropic.Anthropic(api_key=api_key)
         with open(image_path, "rb") as f:
@@ -144,6 +158,7 @@ B,180000,250250
         return None
 
 def validate_extracted_data(csv_text, expected_columns=2):
+    """Validates the extracted CSV data."""
     try:
         df = pd.read_csv(io.StringIO(csv_text))
         if len(df.columns) != expected_columns + 1:
@@ -154,6 +169,7 @@ def validate_extracted_data(csv_text, expected_columns=2):
         return False
 
 def extract_with_retries(image_path, api_key, max_retries=3):
+    """Attempts to extract data multiple times if needed."""
     for attempt in range(max_retries):
         result = extract_data_with_claude(image_path, api_key)
         if result and result.get("csv_text") and validate_extracted_data(result["csv_text"]):
@@ -162,18 +178,24 @@ def extract_with_retries(image_path, api_key, max_retries=3):
     return None
 
 def convert_csv_to_dataframe(csv_text):
+    """Converts the CSV text to a pandas DataFrame."""
     try:
         csv_text = csv_text.strip()
-        return pd.read_csv(io.StringIO(csv_text))
+        df = pd.read_csv(io.StringIO(csv_text))
+        return df
     except Exception as e:
         print(f"Error converting CSV text to DataFrame: {e}")
         return None
 
-#############################################
-# Excel Sheet Creation
-#############################################
-
 def create_excel_tab_with_data(dataframe, excel_writer, tab_name, original_image_path, chart_type, y_axis_info):
+    """
+    Creates an Excel tab with:
+      - The tabular data at the top-left,
+      - (The chart will later be inserted via xlwings or openpyxl.)
+      - The original graph image always placed in column G.
+      - Additionally, the extracted chart type and Y-axis details are stored in hidden cell Z1 and Z2.
+      - Also, the last row of the table (header plus data) is stored in cell AA1.
+    """
     try:
         dataframe.to_excel(excel_writer, sheet_name=tab_name, index=False, startrow=1)
         workbook = excel_writer.book
@@ -183,7 +205,7 @@ def create_excel_tab_with_data(dataframe, excel_writer, tab_name, original_image
         worksheet["Z1"] = chart_type
         worksheet["Z2"] = y_axis_info
         num_data_rows = len(dataframe) + 1  # including header row
-        worksheet["AA1"] = num_data_rows  # store table end row for layout
+        worksheet["AA1"] = num_data_rows  # store table end row (header included)
         with Image.open(original_image_path) as img:
             cropped_img = crop_graph_opencv(img, margin=10, extra_margin_ratio=0.5)
             max_width = 600
@@ -192,18 +214,24 @@ def create_excel_tab_with_data(dataframe, excel_writer, tab_name, original_image
             resized_image = cropped_img.resize((max_width, new_height), Image.Resampling.LANCZOS)
             resized_image_path = original_image_path.replace('.png', '_resized.png')
             resized_image.save(resized_image_path)
-        # Place original graph image in column J.
+        # Place original graph image in column G, below the table.
         chart_row = int(worksheet["AA1"].value) + 2
-        worksheet["J" + str(chart_row - 1)] = "Original Graph:"
-        worksheet.add_image(XLImage(resized_image_path), "J" + str(chart_row))
+        worksheet["G" + str(chart_row - 1)] = "Original Graph:"
+        worksheet.add_image(XLImage(resized_image_path), "G" + str(chart_row))
     except Exception as e:
         print(f"Error creating tab {tab_name} in Excel: {e}")
 
-#############################################
-# Chart Insertion Functions
-#############################################
-
 def map_chart_type(chart_type_val):
+    """
+    Maps the extracted chart type metadata to an Excel chart type constant.
+    Returns:
+      - For 2D line charts: -4101 (xlLine)
+      - For 2D bar/column charts: 51 (xlColumnClustered)
+      - For 2D pie charts: -4169 (xlPie)
+      - For 3D bar/column charts: 15 (xl3DColumnClustered) [example]
+      - For 3D pie charts: -4160 (xl3DPie) [example]
+    Defaults to 2D line if ambiguous.
+    """
     if not chart_type_val:
         return -4101
     ct = chart_type_val.lower()
@@ -213,8 +241,7 @@ def map_chart_type(chart_type_val):
         elif "pie" in ct:
             return -4160
         elif "line" in ct:
-            # Return 65 for a standard 2D line chart with markers.
-            return 65
+            return -4101
         else:
             return -4101
     else:
@@ -223,49 +250,43 @@ def map_chart_type(chart_type_val):
         elif "bar" in ct:
             return 51
         elif "line" in ct:
-            return 65
+            return -4101
         else:
             return -4101
 
-def nice_scale(data_min, data_max):
-    """
-    Rounds the axis limits to “nice” whole numbers.
-    For example, if data_max is 1,000,000 and data_min is 600,000,
-    then we use a step of 50,000.
-    """
-    import math
-    if data_max >= 100000:
-        step = 50000
-    elif data_max >= 10000:
-        step = 5000
-    else:
-        step = 500
-    new_min = math.floor(data_min / step) * step
-    new_max = math.ceil(data_max / step) * step
-    return new_min, new_max, step
-
 def insert_nonpie_charts_xlwings(excel_output_path):
+    """
+    Inserts non-pie charts (line/bar) using xlwings (COM API).
+    For these charts, the first column (excluding header) is used as categories,
+    and the series names are taken from the header row (columns B, C, etc.).
+    The generated chart is placed in column A, below the table.
+    """
     try:
         app = xw.App(visible=False)
         wb = xw.Book(excel_output_path)
         for sheet in wb.sheets:
+            # Skip if this sheet is marked as a pie chart.
             chart_type_val = sheet.range("Z1").value
             if chart_type_val and "pie" in chart_type_val.lower():
                 continue
+
             data_range = sheet.range("A2").expand()
             if data_range.shape[0] < 2 or data_range.shape[1] < 2:
                 continue
+
             nrows, ncols = data_range.shape
             y_axis_val = sheet.range("Z2").value
-            table_end = int(sheet["AA1"].value)
-            # Place generated chart in column A.
-            left = sheet.range("A" + str(table_end + 2)).left
-            top = sheet.range("A" + str(table_end + 2)).top
-            width = 350
-            height = 210
+            # Get the table end row from hidden cell AA1.
+            table_end_row = sheet["AA1"].value
+            left = sheet.range("A" + str(int(table_end_row) + 2)).left
+            top = sheet.range("A" + str(int(table_end_row) + 2)).top
+            width = 500
+            height = 300
             chart_obj = sheet.api.ChartObjects().Add(left, top, width, height)
             chart_com = chart_obj.Chart
+            # Determine orientation.
             if (nrows - 1) < (ncols - 1):
+                # Horizontal: first row holds categories.
                 cat_range = sheet.range(data_range.address).offset(0, 0).resize(1, ncols)
                 ser_range = sheet.range(data_range.address).offset(1, 0).resize(nrows - 1, ncols)
                 chart_com.SetSourceData(Source=ser_range.api)
@@ -273,9 +294,11 @@ def insert_nonpie_charts_xlwings(excel_output_path):
                 sc = chart_com.SeriesCollection()
                 for i in range(1, sc.Count + 1):
                     sc.Item(i).XValues = cat_range.api
+                    # Set series name from first column of corresponding row (row 3 onward).
                     series_name = sheet.range("A2").offset(i, 0).value
                     sc.Item(i).Name = series_name
             else:
+                # Vertical: first column is categories.
                 cat_range = sheet.range(data_range.address).offset(1, 0).resize(nrows - 1, 1)
                 ser_range = sheet.range(data_range.address).offset(1, 1).resize(nrows - 1, ncols - 1)
                 chart_com.SetSourceData(Source=ser_range.api)
@@ -283,21 +306,14 @@ def insert_nonpie_charts_xlwings(excel_output_path):
                 sc = chart_com.SeriesCollection()
                 for i in range(1, sc.Count + 1):
                     sc.Item(i).XValues = cat_range.api
+                    # Set series name from header row (row2, columns B, C, etc.)
                     series_name = sheet.range("B2").offset(0, i - 1).value
                     sc.Item(i).Name = series_name
+
             excel_chart_type = map_chart_type(chart_type_val)
             chart_com.ChartType = excel_chart_type
             chart_com.HasTitle = True
             chart_com.ChartTitle.Text = "Recreated Graph"
-            # Ensure the line graph is head-on 2D.
-            if excel_chart_type == 65:
-                try:
-                    chart_com.ChartArea.Format.ThreeD.Visible = False
-                    chart_com.PlotArea.Format.ThreeD.Visible = False
-                    chart_com.Rotation = 0
-                    chart_com.Elevation = 0
-                except Exception as e:
-                    debug_print("Error disabling 3D for line chart:", e)
             if excel_chart_type not in [-4169, -4160]:
                 if (nrows - 1) < (ncols - 1):
                     x_title = sheet.range(data_range.address).offset(0, 0).value
@@ -316,33 +332,6 @@ def insert_nonpie_charts_xlwings(excel_output_path):
                 else:
                     y_label = "Value"
                 chart_com.Axes(2).AxisTitle.Text = y_label
-
-                # --- Adjust Y-axis scaling based on series data ---
-                data_values = ser_range.value
-                numeric_values = []
-                if isinstance(data_values, list):
-                    for row in data_values:
-                        if isinstance(row, (list, tuple)):
-                            for cell in row:
-                                try:
-                                    numeric_values.append(float(cell))
-                                except Exception:
-                                    pass
-                        else:
-                            try:
-                                numeric_values.append(float(row))
-                            except Exception:
-                                pass
-                if numeric_values:
-                    data_min = min(numeric_values)
-                    data_max = max(numeric_values)
-                    new_min, new_max, major_unit = nice_scale(data_min, data_max)
-                    try:
-                        chart_com.Axes(2).MinimumScale = new_min
-                        chart_com.Axes(2).MaximumScale = new_max
-                        chart_com.Axes(2).MajorUnit = major_unit
-                    except Exception as e:
-                        print(f"Error setting Y-axis scaling on sheet {sheet.name}: {e}")
         wb.save()
         wb.close()
         app.quit()
@@ -351,10 +340,15 @@ def insert_nonpie_charts_xlwings(excel_output_path):
         print(f"Error inserting non-pie charts with xlwings: {e}")
 
 def insert_pie_charts_openpyxl(excel_output_path):
+    """
+    Inserts pie charts using openpyxl's chart objects.
+    For sheets where cell Z1 indicates a pie chart, a PieChart is created using
+    the first two columns (excluding header row) and placed in column A, below the table.
+    """
     try:
         from openpyxl import load_workbook
         from openpyxl.chart import PieChart, Reference
-        from openpyxl.chart.label import DataLabelList
+
         wb = load_workbook(excel_output_path)
         for sheet in wb.worksheets:
             chart_type_cell = sheet["Z1"].value
@@ -363,19 +357,13 @@ def insert_pie_charts_openpyxl(excel_output_path):
                 if not table_end_row or int(table_end_row) < 2:
                     continue
                 last_row = int(table_end_row)
+                # Use columns A and B (excluding header row)
                 data = Reference(sheet, min_col=2, min_row=3, max_row=last_row)
                 cats = Reference(sheet, min_col=1, min_row=3, max_row=last_row)
                 pie = PieChart()
                 pie.title = "Recreated Graph"
                 pie.add_data(data, titles_from_data=False)
                 pie.set_categories(cats)
-                dlabels = DataLabelList()
-                dlabels.showPercent = False
-                dlabels.showVal = True
-                dlabels.showCatName = False
-                dlabels.showSerName = False
-                dlabels.number_format = "General"
-                pie.dataLabels = dlabels
                 chart_position = "A" + str(last_row + 2)
                 sheet.add_chart(pie, chart_position)
         wb.save(excel_output_path)
@@ -383,11 +371,8 @@ def insert_pie_charts_openpyxl(excel_output_path):
     except Exception as e:
         print(f"Error inserting pie charts with openpyxl: {e}")
 
-#############################################
-# Process Integration
-#############################################
-
 def process_pdf_to_excel(pdf_path, excel_output_path):
+    """Processes a PDF, extracts chart images, analyzes them, and saves structured data to Excel."""
     try:
         api_key = read_anthropic_key()
         if not api_key:

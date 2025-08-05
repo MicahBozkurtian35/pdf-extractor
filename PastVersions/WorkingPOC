@@ -1,0 +1,261 @@
+import anthropic
+import base64
+import os
+import io
+import pandas as pd
+import openpyxl
+import shutil
+from pdf2image import convert_from_path
+from PIL import Image
+from openpyxl.drawing.image import Image as XLImage
+
+def read_anthropic_key(file_path=r"C:\API\anthropic_key.txt"):
+    """Reads the Anthropic API key from a text file and returns it."""
+    try:
+        with open(file_path, "r") as f:
+            api_key = f.read().strip()
+            return api_key
+    except Exception as e:
+        print(f"Error reading Anthropic API key from {file_path}: {e}")
+        return None
+
+def pdf_to_pngs(pdf_path, output_dir="temp_images"):
+    """Extracts graph images from a PDF and saves them to the output folder."""
+    os.makedirs(output_dir, exist_ok=True)
+    poppler_path = r"C:\poppler\poppler-24.08.0\Library\bin"
+
+    images = convert_from_path(pdf_path, poppler_path=poppler_path)
+    image_paths = []
+
+    for i, image in enumerate(images):
+        box = image.getbbox()
+        if box:
+            graph_image = image.crop(box)
+            image_path = os.path.join(output_dir, f"chart_{i}.png")
+            graph_image.save(image_path, "PNG")
+            image_paths.append(image_path)
+            print(f"Extracted graph image saved to {image_path}")
+
+    return image_paths
+
+def validate_extracted_data(csv_text, expected_columns=2):
+    """Validates the extracted CSV data."""
+    try:
+        df = pd.read_csv(io.StringIO(csv_text))
+        if len(df.columns) != expected_columns + 1:  # +1 for category column
+            print(f"Warning: Unexpected number of columns: {len(df.columns)}")
+        return all(df.iloc[:, 1:].apply(lambda x: x.dtype in ['int64', 'float64']))
+    except:
+        return False
+
+def extract_data_with_claude(image_path, api_key):
+    """Extracts structured data from a chart image using Claude 3 Sonnet with improved accuracy."""
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+
+        with open(image_path, "rb") as f:
+            image_data = f.read()
+        base64_encoded_image = base64.b64encode(image_data).decode("utf-8")
+
+        file_extension = os.path.splitext(image_path)[1].lower()
+        mime_type = {
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.gif': 'image/gif',
+            '.webp': 'image/webp'
+        }.get(file_extension, 'image/png')
+
+        prompt_text = """
+        Be as accurate as possible and provide the tabular data from this graph in CSV format.
+
+        Requirements:
+        1. Extract EXACT numerical values from the graph
+        2. Maintain all categories and periods in separate columns
+        3. Return ONLY the CSV data, no explanations or additional text
+        4. Double-check all values for accuracy before responding
+        5. Use precise numbers, not approximations
+
+        Format your response as raw CSV data only, like this:
+        Category,Period 1,Period 2
+        Value 1,X,Y
+        """
+
+        response = client.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=1024,
+            temperature=0.0,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt_text},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": mime_type,
+                                "data": base64_encoded_image
+                            }
+                        }
+                    ]
+                }
+            ]
+        )
+
+        response_text = response.content[0].text if response.content else ""
+
+        csv_lines = []
+        capture = False
+        for line in response_text.split('\n'):
+            if ',' in line:
+                capture = True
+            if capture and line.strip():
+                csv_lines.append(line.strip())
+
+        csv_text = '\n'.join(csv_lines)
+
+        if csv_text:
+            print(f"Extracted CSV Data:\n{csv_text}")
+            return csv_text
+        else:
+            print(f"Claude returned an empty response for {image_path}.")
+            return None
+
+    except Exception as e:
+        print(f"Error processing image with Claude: {e}")
+        return None
+
+def extract_with_retries(image_path, api_key, max_retries=3):
+    """Attempts to extract data multiple times if needed."""
+    for attempt in range(max_retries):
+        csv_text = extract_data_with_claude(image_path, api_key)
+        if csv_text and validate_extracted_data(csv_text):
+            return csv_text
+        print(f"Retry {attempt + 1}/{max_retries}")
+    return None
+
+def convert_csv_to_dataframe(csv_text):
+    """Converts the CSV text to a pandas DataFrame."""
+    try:
+        csv_text = csv_text.strip()
+        df = pd.read_csv(io.StringIO(csv_text))
+        return df
+    except Exception as e:
+        print(f"Error converting CSV text to DataFrame: {e}")
+        return None
+
+def create_excel_tab_with_data(dataframe, excel_writer, tab_name, original_image_path):
+    """Creates an Excel tab with structured data, recreated chart, and original image."""
+    try:
+        # Write the DataFrame starting at row 2
+        dataframe.to_excel(excel_writer, sheet_name=tab_name, index=False, startrow=1)
+
+        workbook = excel_writer.book
+        worksheet = excel_writer.sheets[tab_name]
+
+        # Add title
+        worksheet['A1'] = "Graph Analysis Results"
+        title_cell = worksheet['A1']
+        title_cell.font = openpyxl.styles.Font(size=14, bold=True)
+
+        # Get the dimensions for layout
+        num_rows = len(dataframe.index) + 1  # +1 for header
+        num_cols = len(dataframe.columns)
+
+        # Create and position the recreated bar chart
+        chart = openpyxl.chart.BarChart()
+        chart.type = "col"
+        chart.title = "Recreated Graph"
+        chart.x_axis.title = dataframe.columns[0]
+        chart.y_axis.title = "Value"
+
+        data_range = openpyxl.chart.Reference(worksheet, min_col=2, min_row=2, max_col=num_cols, max_row=num_rows + 1)
+        categories = openpyxl.chart.Reference(worksheet, min_col=1, min_row=3, max_col=1, max_row=num_rows + 1)
+
+        chart.add_data(data_range, titles_from_data=True)
+        chart.set_categories(categories)
+        chart.grouping = "clustered"
+
+        # Position recreated chart
+        chart_cell = 'A' + str(num_rows + 5)
+        worksheet.add_chart(chart, chart_cell)
+
+        # Add original image
+        # Resize image to reasonable dimensions
+        with Image.open(original_image_path) as img:
+            # Calculate new dimensions (max width 800px while maintaining aspect ratio)
+            max_width = 800
+            width_percent = (max_width / float(img.size[0]))
+            new_height = int((float(img.size[1]) * float(width_percent)))
+
+            # Create a copy of the image with new dimensions
+            resized_image_path = original_image_path.replace('.png', '_resized.png')
+            img = img.resize((max_width, new_height), Image.Resampling.LANCZOS)
+            img.save(resized_image_path)
+
+        # Add the resized image to Excel
+        img = XLImage(resized_image_path)
+        img_cell = 'A' + str(num_rows + 25)  # Position below the recreated chart
+        worksheet.add_image(img, img_cell)
+
+        # Add section headers
+        worksheet['A' + str(num_rows + 4)] = "Recreated Graph:"
+        worksheet['A' + str(num_rows + 24)] = "Original Graph:"
+
+        # Adjust column widths
+        for column in worksheet.columns:
+            max_length = 0
+            column = [cell for cell in column]
+            for cell in column:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(cell.value)
+                except:
+                    pass
+            adjusted_width = (max_length + 2)
+            worksheet.column_dimensions[column[0].column_letter].width = adjusted_width
+
+    except Exception as e:
+        print(f"Error creating tab {tab_name} in Excel: {e}")
+
+def process_pdf_to_excel(pdf_path, excel_output_path):
+    """Processes a PDF, extracts chart images, analyzes them, and saves structured data to Excel."""
+    try:
+        api_key = read_anthropic_key()
+        if not api_key:
+            print("Could not authenticate with Claude API.")
+            return
+
+        image_paths = pdf_to_pngs(pdf_path)
+        excel_writer = pd.ExcelWriter(excel_output_path, engine="openpyxl")
+        sheet_added = False
+
+        for image_path in image_paths:
+            print(f"Processing {image_path}...")
+
+            extracted_csv = extract_with_retries(image_path, api_key)
+            if extracted_csv:
+                dataframe = convert_csv_to_dataframe(extracted_csv)
+                if dataframe is not None and not dataframe.empty:
+                    tab_name = os.path.splitext(os.path.basename(image_path))[0]
+                    create_excel_tab_with_data(dataframe, excel_writer, tab_name, image_path)
+                    sheet_added = True
+
+        if sheet_added:
+            excel_writer.close()
+            print(f"Excel file created: {excel_output_path}")
+        else:
+            print("No valid data extracted. Skipping Excel file creation.")
+
+        # Clean up temporary files
+        shutil.rmtree("temp_images", ignore_errors=True)
+
+    except Exception as e:
+        print(f"Error processing PDF {pdf_path}: {e}")
+
+if __name__ == "__main__":
+    pdf_file_path = r"C:\Users\Mbomm\IdeaProjects\PDF Graph Scanner\input_pdfs\Sample2.pdf"
+    excel_file_path = "output.xlsx"
+
+    process_pdf_to_excel(pdf_file_path, excel_file_path)
