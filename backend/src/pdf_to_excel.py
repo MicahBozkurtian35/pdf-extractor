@@ -198,6 +198,28 @@ def process_pdf_to_excel(pdf_path, excel_output_path):
         os.rmdir("enhanced_images")
     except Exception as e:
         print(f"Error generating Excel File from PDF {pdf_path}: {e}")
+
+
+def process_pdf(pdf_path):
+    """
+    Wrapper for Flask backend — processes a PDF and returns a status message.
+    """
+    try:
+        # Output Excel file path — could also be a temp folder
+        excel_output_path = os.path.splitext(pdf_path)[0] + ".xlsx"
+
+        process_pdf_to_excel(pdf_path, excel_output_path)
+
+        return {
+            "excel_file": excel_output_path,
+            "status": "success"
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e)
+        }
+
 # --- Main Execution ---
 
 if __name__ == "__main__":
