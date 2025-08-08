@@ -1,229 +1,225 @@
 import os
 import io
-from pdf2image import convert_from_path
-from PIL import Image, ImageEnhance, ImageDraw
-import pandas as pd
-import openpyxl
-import google.generativeai as genai
-import uuid
 import re
 import base64
+import pandas as pd
+from pdf2image import convert_from_path
+from PIL import Image, ImageDraw
+import requests
+from dotenv import load_dotenv
 
-# --- Helper Functions ---
+# Load .env (must be in the same folder as server.py/pdf_to_excel.py)
+load_dotenv()
 
-def authenticate_google_cloud(key_path=r"C:\API\api_key.txt"):
-    """Authenticates with Google Cloud using a service account key."""
-    try:
-        print(f"Trying to open api key at {key_path}")
-        with open(key_path, 'r') as file:
-            api_key = file.read().strip()
-            print(f"API KEY IS: {api_key}")
-            genai.configure(api_key=api_key)
-            print("Successfully authenticated")
-            return genai
-    except Exception as e:
-        print("Error authenticating with Google API Key")
-        print(f"Exception is {e}")
-        return None
-
-
+# -----------------------------
+# Step 1: PDF -> PNG images
+# -----------------------------
 def pdf_to_pngs(pdf_path, output_dir="temp_images"):
-    """Extracts only graph images from a PDF and saves them to the output folder."""
     os.makedirs(output_dir, exist_ok=True)
-    poppler_path = r"C:\poppler\poppler-24.08.0\Library\bin"  # <--- Absolute path to poppler
+    # Update to your poppler path if needed
+    poppler_path = r"C:\Users\dbozk\Micah Code\poppler-24.08.0\Library\bin"
+    images = convert_from_path(pdf_path, poppler_path=poppler_path)
 
-    images = convert_from_path(pdf_path, poppler_path=poppler_path) #load the pdf as a list of images
-    image_paths = [] #list of the paths of extracted graph images
-    img_count = 0
+    image_paths = []
+    for i, image in enumerate(images):
+        box = image.getbbox()
+        if not box:
+            continue
 
-    for i, image in enumerate(images): #iterate through each of the images/pages in the pdf
-        width, height = image.size
-        # Define some minimum size for the bounding box of graph images
-        min_graph_width = 200
-        min_graph_height = 100
-        # Detect bounding boxes and filter based on those bounding boxes
-        image_list = images[i].getbbox()
-
-        for j, box in enumerate(image_list): # go through each bounding box
-            x0, y0, x1, y1 = box
-            try:
-                if x1 - x0 > min_graph_width and y1 - y0 > min_graph_height: # filter out small objects, that are likely noise, but keep ones that are of a particular size
-                    # We've identified a bounding box that is large enough, now extract and save it
-                    graph_image = images[i].crop(box)
-                    image_path = os.path.join(output_dir, f"chart_{img_count}.png")
-                    graph_image.save(image_path, "PNG")
-                    image_paths.append(image_path)
-                    img_count += 1
-                    print(f"Extracted graph image saved to {image_path}")
-            except:
-                print("broke")
+        x0, y0, x1, y1 = box
+        if (x1 - x0) > 200 and (y1 - y0) > 100:
+            graph_image = image.crop(box)
+            out_path = os.path.join(output_dir, f"chart_{i}.png")
+            graph_image.save(out_path, "PNG")
+            image_paths.append(out_path)
 
     return image_paths
 
+# -----------------------------
+# Step 2: Enhance image (zoom + grid)
+# -----------------------------
 def enhance_image(image_path, output_dir="enhanced_images"):
-    """Adds gridlines and zooms in on the image to make it easier to process"""
-
     os.makedirs(output_dir, exist_ok=True)
     try:
         img = Image.open(image_path)
-        width, height = img.size
-        # Zoom in a little bit
-        zoom_factor = 1.2
-        new_width = int(width * zoom_factor)
-        new_height = int(height * zoom_factor)
-        img = img.resize((new_width, new_height), Image.LANCZOS)
+        img = img.resize((int(img.width * 1.2), int(img.height * 1.2)), Image.LANCZOS)
 
-        width, height = img.size
-
-        # Draw grid lines
         draw = ImageDraw.Draw(img)
-        grid_spacing = 25
-        for x in range(0, width, grid_spacing):
-            draw.line([(x, 0), (x, height)], fill='grey')
-        for y in range(0, height, grid_spacing):
-            draw.line([(0, y), (width, y)], fill='grey')
+        for x in range(0, img.width, 25):
+            draw.line([(x, 0), (x, img.height)], fill="grey")
+        for y in range(0, img.height, 25):
+            draw.line([(0, y), (img.width, y)], fill="grey")
 
-        # Save enhanced image
-        filename = os.path.basename(image_path)
-        output_path = os.path.join(output_dir, filename)
-        img.save(output_path, "PNG")
-        return output_path
+        out_path = os.path.join(output_dir, os.path.basename(image_path))
+        img.save(out_path, "PNG")
+        return out_path
     except Exception as e:
-        print(f"Error enhancing image at {image_path}: {e}")
+        print(f"Error enhancing image: {e}")
         return None
 
-def extract_data_with_ai(image_path, genai_client, model_name="gemini-pro"):
-    """Extracts tabular data from an image using Google Gemini API."""
+# -----------------------------
+# Step 3: Call OpenRouter (VISION model)
+# -----------------------------
+def extract_data_with_openrouter(image_path: str, model: str | None = None) -> str | None:
+    """
+    Sends the enhanced image to OpenRouter with a strict CSV-only instruction.
+    Returns raw string (ideally CSV). Your CSV parser handles fences/TSV fallback.
+    """
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        print("ERROR: OPENROUTER_API_KEY not set in .env")
+        return None
+
+    # Choose a vision-capable model (env overrides this default)
+    model_id = model or os.getenv("OPENROUTER_MODEL", "openrouter/auto")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        # These two help OpenRouter attribute usage & avoid some rate issues
+        "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "http://localhost:5173"),
+        "X-Title": os.getenv("OPENROUTER_APP_NAME", "pdf-extractor"),
+    }
+
+    # Read image as base64 data URL
     try:
-        model = genai_client.GenerativeModel(model_name)
         with open(image_path, "rb") as f:
-            image_data = f.read()
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+    except Exception as e:
+        print(f"Error reading image for OpenRouter: {e}")
+        return None
 
-        base64_encoded_image = base64.b64encode(image_data).decode("utf-8")
+    payload = {
+        "model": model_id,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "You are a strict CSV extractor. From the chart image, extract any tabular/series data. "
+                            "Respond with CSV only. No commentary, no code fences, no backticks, no markdown."
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64}"},
+                    },
+                ],
+            }
+        ],
+    }
 
-        prompt = f"""
-        Please analyze this image, and extract any tabular data. Respond only with a CSV representation of the data
-        data: {base64_encoded_image}
-        """
-        response = model.generate_content(prompt)
+    try:
+        resp = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=120,
+        )
+    except Exception as e:
+        print(f"OpenRouter network error: {e}")
+        return None
 
-        if response.text:
-            return response.text
-        elif response.prompt_feedback:
-            print(response.prompt_feedback)
+    if not resp.ok:
+        print(f"OpenRouter HTTP error {resp.status_code}: {resp.text[:400]}")
+        return None
+
+    try:
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        return content.strip() if content else None
+    except Exception:
+        print(f"Unexpected OpenRouter response: {resp.text[:400]}")
+        return None
+
+# -----------------------------
+# Step 4: CSV text -> DataFrame
+# -----------------------------
+import csv
+
+def convert_csv_to_dataframe(raw_text: str):
+    """Parse CSV/TSV-ish text robustly into a DataFrame."""
+    try:
+        if not raw_text or not raw_text.strip():
             return None
+
+        text = raw_text.strip()
+
+        # Strip fences if a model ignored instructions
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:csv|tsv)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+
+        # Sniff delimiter
+        sample = "\n".join(text.splitlines()[:10])
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",\t;|")
+            delim = dialect.delimiter
+        except Exception:
+            if "\t" in sample:
+                delim = "\t"
+            elif "," in sample:
+                delim = ","
+            else:
+                # Convert 2+ spaces to comma as a fallback
+                text = re.sub(r"[ ]{2,}", ",", text)
+                delim = ","
+
+        if delim == ",":
+            text = text.replace("\t", ",")
+
+        df = pd.read_csv(io.StringIO(text), delimiter=delim)
+        return None if df.empty else df
     except Exception as e:
-        print(f"Error generating content with AI on {image_path}: {e}")
+        print(f"Error converting text to DataFrame: {e}")
         return None
 
-def convert_csv_to_dataframe(csv_text):
-    """Converts the CSV text to pandas dataframe, returns a dataframe"""
+# -----------------------------
+# Main pipeline for Flask
+# -----------------------------
+def process_pdf_to_data(pdf_path):
     try:
-        csv_text = csv_text.strip()
-        csv_text = re.sub(r'[^\x00-\x7F]+', '', csv_text)
-        df = pd.read_csv(io.StringIO(csv_text))
-        return df
-    except Exception as e:
-        print(f"Error converting text to CSV: {e}")
-        return None
-
-
-def create_excel_tab_with_data(dataframe, excel_writer, tab_name):
-    """Creates a tab with data and chart in an Excel file."""
-    try:
-        # Write DataFrame to Excel
-        dataframe.to_excel(excel_writer, sheet_name=tab_name, index=False,startrow=2)
-
-        # Get the range of data
-        max_row = len(dataframe.index) + 2
-        max_col = len(dataframe.columns)
-
-        # Create a chart
-        workbook  = excel_writer.book
-        worksheet = excel_writer.sheets[tab_name]
-        chart = openpyxl.chart.BarChart()
-        chart.type = "col"
-        chart.title = tab_name
-        chart.x_axis.title = dataframe.columns[0]  # Set x-axis title from column headers
-        chart.y_axis.title = "Value"
-
-
-        data_range = openpyxl.chart.Reference(worksheet, min_col=2, min_row=3, max_col=max_col, max_row=max_row)
-        categories = openpyxl.chart.Reference(worksheet, min_col=1, min_row=3, max_col=1, max_row=max_row)
-        chart.add_data(data_range, titles_from_data=False)
-        chart.set_categories(categories)
-
-        worksheet.add_chart(chart, "A" + str(max_row+3)) #position chart
-
-    except Exception as e:
-        print(f"Error creating tab {tab_name} in Excel: {e}")
-
-
-def compare_charts(original_image, generated_chart_image):
-    """Compares the original chart to the generated chart and provides a comparison metric"""
-    # This function is for quality control, but is left empty here to help keep the script simple
-
-def process_pdf_to_excel(pdf_path, excel_output_path):
-    """Main function to process PDF and create the Excel output."""
-    try:
-        genai_client = authenticate_google_cloud()
-        if not genai_client:
-            print("Could not authenticate to Google AI Studio")
-            return
-
         temp_images = pdf_to_pngs(pdf_path)
-
-        excel_writer = pd.ExcelWriter(excel_output_path, engine="openpyxl")
+        results = []
+        debug_raw = []  # optional: helpful for debugging
 
         for image_path in temp_images:
-            print(f"Processing {image_path}")
-            # Enhance the image and prepare for better data extraction
-            enhanced_image_path = enhance_image(image_path)
-
-            # Get the extracted text from the model
-            extracted_text = extract_data_with_ai(enhanced_image_path, genai_client)
-            if extracted_text: #check if the extracted_text is not none
-                # Convert the text to pandas dataframe
-                dataframe = convert_csv_to_dataframe(extracted_text)
-                if dataframe is not None:
-                    tab_name = os.path.splitext(os.path.basename(image_path))[0] # get file name without extension
-                    create_excel_tab_with_data(dataframe, excel_writer, tab_name)
-            else:
-                print(f"Could not extract data from AI for {enhanced_image_path}")
+            enhanced_path = enhance_image(image_path)
+            if not enhanced_path:
+                print(f"Skipping enhancement: {image_path}")
                 continue
 
-        excel_writer.close()
-        print(f"Created Excel file at {excel_output_path}")
-        os.rmdir("temp_images")
-        os.rmdir("enhanced_images")
-    except Exception as e:
-        print(f"Error generating Excel File from PDF {pdf_path}: {e}")
+            print(f"Processing image: {enhanced_path}")
+            extracted_text = extract_data_with_openrouter(enhanced_path)
+            print("Raw model output (first 300 chars):", (extracted_text or "")[:300])
 
+            debug_raw.append({
+                "image": os.path.basename(image_path),
+                "raw": (extracted_text or "")[:1000]
+            })
 
-def process_pdf(pdf_path):
-    """
-    Wrapper for Flask backend — processes a PDF and returns a status message.
-    """
-    try:
-        # Output Excel file path — could also be a temp folder
-        excel_output_path = os.path.splitext(pdf_path)[0] + ".xlsx"
+            if extracted_text:
+                df = convert_csv_to_dataframe(extracted_text)
+                if df is not None:
+                    results.append({
+                        "image": os.path.basename(image_path),
+                        "data": df.to_dict(orient="records")
+                    })
 
-        process_pdf_to_excel(pdf_path, excel_output_path)
-
+        # Return both parsed tables and raw text (raw is useful while iterating)
         return {
-            "excel_file": excel_output_path,
-            "status": "success"
-        }
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e)
+            "tables": results,
+            "debug_raw": debug_raw
         }
 
-# --- Main Execution ---
+    except Exception as e:
+        return {"error": str(e)}
 
+# -----------------------------
+# Optional local test
+# -----------------------------
 if __name__ == "__main__":
-    pdf_file_path = r"C:\Users\Mbomm\IdeaProjects\PDF Graph Scanner\input_pdfs\Sample1.pdf"  # <-- Add the absolute path to the PDF here
-    excel_file_path = "output.xlsx"
-
-    process_pdf_to_excel(pdf_file_path, excel_file_path)
+    test_pdf = r"C:\Users\Mbomm\IdeaProjects\PDF Graph Scanner\input_pdfs\Sample1.pdf"
+    print(process_pdf_to_data(test_pdf))
