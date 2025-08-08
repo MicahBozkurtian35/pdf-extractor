@@ -19,3 +19,5 @@ build/
 *.tmp
 "api_key.json" 
 "api_key.txt" 
+.env
+.env
