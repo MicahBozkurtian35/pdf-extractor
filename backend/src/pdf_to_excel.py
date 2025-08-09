@@ -17,7 +17,7 @@ load_dotenv()
 def pdf_to_pngs(pdf_path, output_dir="temp_images"):
     os.makedirs(output_dir, exist_ok=True)
     # Update to your poppler path if needed
-    poppler_path = r"C:\Users\dbozk\Micah Code\poppler-24.08.0\Library\bin"
+    poppler_path = r"C:\Users\Mbomm\Poppler\poppler-24.08.0\Library\bin"
     images = convert_from_path(pdf_path, poppler_path=poppler_path)
 
     image_paths = []
@@ -128,8 +128,10 @@ def extract_data_with_openrouter(image_path: str, model: str | None = None) -> s
 
     try:
         data = resp.json()
+        print("DEBUG: Full OpenRouter JSON response:", data)  # 👈 ADD THIS LINE
         content = data["choices"][0]["message"]["content"]
         return content.strip() if content else None
+
     except Exception:
         print(f"Unexpected OpenRouter response: {resp.text[:400]}")
         return None

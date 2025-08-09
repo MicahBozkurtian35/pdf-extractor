@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import os
 from pdf_to_excel import process_pdf_to_data
@@ -8,6 +8,12 @@ load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
+IMAGES_DIR = os.path.join(os.path.dirname(__file__), "enhanced_images")
+
+@app.route("/images/<path:filename>")
+def images(filename):
+    return send_from_directory(IMAGES_DIR, filename)
+
 
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
