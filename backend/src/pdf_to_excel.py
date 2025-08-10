@@ -2,22 +2,42 @@ import os
 import io
 import re
 import base64
+import csv
 import pandas as pd
 from pdf2image import convert_from_path
 from PIL import Image, ImageDraw
 import requests
 from dotenv import load_dotenv
 
-# Load .env (must be in the same folder as server.py/pdf_to_excel.py)
+# Load .env (must be in same folder as server.py/pdf_to_excel.py)
 load_dotenv()
+
+# --------- helpers ----------
+def _env_bool(name: str, default: bool = False) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
 
 # -----------------------------
 # Step 1: PDF -> PNG images
 # -----------------------------
 def pdf_to_pngs(pdf_path, output_dir="temp_images"):
     os.makedirs(output_dir, exist_ok=True)
-    # Update to your poppler path if needed
-    poppler_path = r"C:\Users\Mbomm\Poppler\poppler-24.08.0\Library\bin"
+    poppler_path = os.getenv("POPPLER_PATH") or None  # if Poppler is on PATH, leave None
+
     images = convert_from_path(pdf_path, poppler_path=poppler_path)
 
     image_paths = []
@@ -36,19 +56,29 @@ def pdf_to_pngs(pdf_path, output_dir="temp_images"):
     return image_paths
 
 # -----------------------------
-# Step 2: Enhance image (zoom + grid)
+# Step 2: Enhance image (zoom + optional grid)
 # -----------------------------
 def enhance_image(image_path, output_dir="enhanced_images"):
     os.makedirs(output_dir, exist_ok=True)
     try:
         img = Image.open(image_path)
-        img = img.resize((int(img.width * 1.2), int(img.height * 1.2)), Image.LANCZOS)
 
-        draw = ImageDraw.Draw(img)
-        for x in range(0, img.width, 25):
-            draw.line([(x, 0), (x, img.height)], fill="grey")
-        for y in range(0, img.height, 25):
-            draw.line([(0, y), (img.width, y)], fill="grey")
+        upscale = _env_float("UPSCALE_FACTOR", 1.2)
+        draw_grid = _env_bool("GRID_OVERLAY", False)
+        grid_step = _env_int("GRID_SPACING", 25)
+
+        if upscale and abs(upscale - 1.0) > 1e-6:
+            img = img.resize(
+                (int(img.width * upscale), int(img.height * upscale)),
+                Image.LANCZOS
+            )
+
+        if draw_grid and grid_step > 0:
+            draw = ImageDraw.Draw(img)
+            for x in range(0, img.width, grid_step):
+                draw.line([(x, 0), (x, img.height)], fill="grey")
+            for y in range(0, img.height, grid_step):
+                draw.line([(0, y), (img.width, y)], fill="grey")
 
         out_path = os.path.join(output_dir, os.path.basename(image_path))
         img.save(out_path, "PNG")
@@ -58,7 +88,7 @@ def enhance_image(image_path, output_dir="enhanced_images"):
         return None
 
 # -----------------------------
-# Step 3: Call OpenRouter (VISION model)
+# Step 3: Call OpenRouter (VISION-capable model)
 # -----------------------------
 def extract_data_with_openrouter(image_path: str, model: str | None = None) -> str | None:
     """
@@ -70,13 +100,13 @@ def extract_data_with_openrouter(image_path: str, model: str | None = None) -> s
         print("ERROR: OPENROUTER_API_KEY not set in .env")
         return None
 
-    # Choose a vision-capable model (env overrides this default)
-    model_id = model or os.getenv("OPENROUTER_MODEL", "openrouter/auto")
+    # Single env knob to switch models freely on OpenRouter
+    model_id = model or os.getenv("LLM_MODEL") or os.getenv("OPENROUTER_MODEL", "openrouter/auto")
 
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        # These two help OpenRouter attribute usage & avoid some rate issues
+        # optional attribution headers recommended by OpenRouter
         "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "http://localhost:5173"),
         "X-Title": os.getenv("OPENROUTER_APP_NAME", "pdf-extractor"),
     }
@@ -104,7 +134,7 @@ def extract_data_with_openrouter(image_path: str, model: str | None = None) -> s
                     },
                     {
                         "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{b64}"},
+                        "image_url": {"url": f"data:image/png;base64,{b64}"}
                     },
                 ],
             }
@@ -128,10 +158,9 @@ def extract_data_with_openrouter(image_path: str, model: str | None = None) -> s
 
     try:
         data = resp.json()
-        print("DEBUG: Full OpenRouter JSON response:", data)  # 👈 ADD THIS LINE
+        print("DEBUG: Full OpenRouter JSON response:", data)
         content = data["choices"][0]["message"]["content"]
         return content.strip() if content else None
-
     except Exception:
         print(f"Unexpected OpenRouter response: {resp.text[:400]}")
         return None
@@ -139,8 +168,6 @@ def extract_data_with_openrouter(image_path: str, model: str | None = None) -> s
 # -----------------------------
 # Step 4: CSV text -> DataFrame
 # -----------------------------
-import csv
-
 def convert_csv_to_dataframe(raw_text: str):
     """Parse CSV/TSV-ish text robustly into a DataFrame."""
     try:
@@ -149,7 +176,7 @@ def convert_csv_to_dataframe(raw_text: str):
 
         text = raw_text.strip()
 
-        # Strip fences if a model ignored instructions
+        # Strip code fences if a model ignored instructions
         if text.startswith("```"):
             text = re.sub(r"^```(?:csv|tsv)?\s*", "", text)
             text = re.sub(r"\s*```$", "", text)
