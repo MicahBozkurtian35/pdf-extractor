@@ -1,213 +1,57 @@
-import { useMemo, useState } from "react";
-import axios from "axios";
+import React, { useState } from "react";
+import "./App.css";
 import {
-  BarChart,
-  Bar,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  Legend,
-  ResponsiveContainer,
+  LineChart, Line, CartesianGrid, XAxis, YAxis, Tooltip, Legend, ResponsiveContainer,
+  BarChart, Bar, ScatterChart, Scatter
 } from "recharts";
 
-const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:5000";
+type Scalar = string | number | boolean | null;
 
-// ------------------ Types ------------------
-interface TableData {
-  image: string;
-  data: Record<string, string | number>[];
-  image_url?: string;
+interface TableRow { [key: string]: Scalar; }
+
+interface TableEntry {
+  page: number;
+  region: number;
+  image: string;         // enhanced crop filename from backend
+  data: TableRow[];      // parsed table/series rows
+  note?: string | null;
+  chart_type?: string | null;   // "line" | "bar" | "stacked_bar" | "scatter" | ...
+  category?: string | null;
+  series_hints?: string[];      // optional, may be undefined
 }
 
-interface DebugRaw {
-  image: string;
-  raw: string;
-  image_url?: string;
+interface DebugEntry { page: number; image: string; raw: string; }
+interface ProcessData { tables: TableEntry[]; debug_raw: DebugEntry[]; }
+
+interface UploadResponse {
+  message: string;
+  filename: string;
+  page_count: number;
+  thumbnails: string[];
 }
 
-interface ExtractResult {
-  tables: TableData[];
-  debug_raw: DebugRaw[];
+interface ProcessPageResponse { message: string; data: ProcessData; }
+
+const backend = (import.meta as any).env?.VITE_BACKEND_URL || "http://localhost:5000";
+
+function urlWithBust(path: string) {
+  const sep = path.includes("?") ? "&" : "?";
+  return `${path}${sep}v=${Date.now()}`;
 }
 
-export default function App() {
-  const [file, setFile] = useState<File | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-  const [result, setResult] = useState<ExtractResult | null>(null);
-
-  const onUpload = async () => {
-    setError("");
-    setLoading(true);
-    setResult(null);
-    try {
-      if (!file) {
-        setError("Choose a PDF first.");
-        setLoading(false);
-        return;
-      }
-
-      const form = new FormData();
-      form.append("file", file);
-
-      const { data } = await axios.post<{ data: ExtractResult }>(
-        `${API_BASE}/upload`,
-        form,
-        { headers: { "Content-Type": "multipart/form-data" } }
-      );
-      setResult(data.data);
-    } catch (e: any) {
-      setError(
-        e?.response?.data?.error || e?.message || "Upload failed. Check backend."
-      );
-    } finally {
-      setLoading(false);
-    }
-  };
-
+function DataTable({ rows }: { rows: TableRow[] }) {
+  if (!rows || rows.length === 0) return <div className="muted">No data</div>;
+  const columns = Object.keys(rows[0] ?? {});
   return (
-    <div style={styles.page}>
-      <header style={styles.header}>PDF Extractor</header>
-
-      <section style={styles.controls}>
-        <input
-          type="file"
-          accept="application/pdf"
-          onChange={(e) => setFile(e.target.files?.[0] || null)}
-        />
-        <button style={styles.button} disabled={loading} onClick={onUpload}>
-          {loading ? "Processing..." : "Upload PDF"}
-        </button>
-      </section>
-
-      {error && <div style={styles.error}>{error}</div>}
-
-      {result && <ResultsPanel apiBase={API_BASE} result={result} />}
-    </div>
-  );
-}
-
-// ------------------ Results Panel ------------------
-interface ResultsPanelProps {
-  apiBase: string;
-  result: ExtractResult;
-}
-
-function ResultsPanel({ apiBase, result }: ResultsPanelProps) {
-  const tables = result?.tables || [];
-  const raw = result?.debug_raw || [];
-
-  if (!tables.length && !raw.length) {
-    return <div style={styles.notice}>No tables found.</div>;
-  }
-
-  return (
-    <div style={styles.panel}>
-      {tables.map((t, idx) => (
-        <ChartCard
-          key={idx}
-          apiBase={apiBase}
-          imageName={t.image}
-          imageUrl={t.image_url || `${apiBase}/images/${t.image}`}
-          rows={t.data}
-          title={`Detected Chart #${idx + 1}`}
-        />
-      ))}
-
-      {raw?.length > 0 && (
-        <details style={styles.details}>
-          <summary style={styles.summary}>Model raw output</summary>
-          <pre style={styles.pre}>{JSON.stringify(raw, null, 2)}</pre>
-        </details>
-      )}
-    </div>
-  );
-}
-
-// ------------------ Chart Card ------------------
-interface ChartCardProps {
-  apiBase: string;
-  imageName: string;
-  imageUrl: string;
-  rows: Record<string, string | number>[];
-  title: string;
-}
-
-function ChartCard({ imageName, imageUrl, rows, title }: ChartCardProps) {
-  const { xKey, seriesKeys } = useMemo(() => inferSchema(rows), [rows]);
-
-  return (
-    <div style={styles.card}>
-      <h3 style={styles.cardTitle}>{title}</h3>
-
-      <div style={styles.sideBySide}>
-        {/* Original chart */}
-        <figure style={styles.figure}>
-          <img src={imageUrl} alt={imageName} style={styles.img} />
-          <figcaption style={styles.caption}>Original (from PDF)</figcaption>
-        </figure>
-
-        {/* Regenerated chart */}
-        <div style={styles.chartWrap}>
-          <ResponsiveContainer width="100%" height={320}>
-            <BarChart
-              data={rows}
-              margin={{ top: 10, right: 20, left: 0, bottom: 10 }}
-            >
-              <CartesianGrid strokeDasharray="3 3" />
-              {xKey && <XAxis dataKey={xKey} />}
-              <YAxis />
-              <Tooltip />
-              <Legend />
-              {seriesKeys.map((k) => (
-                <Bar key={k} dataKey={k} />
-              ))}
-            </BarChart>
-          </ResponsiveContainer>
-          <div style={styles.caption}>Regenerated (from extracted data)</div>
-        </div>
-      </div>
-
-      <DataTable rows={rows} />
-
-      <div style={styles.actions}>
-        <button style={styles.secondaryBtn} onClick={() => downloadCSV(rows)}>
-          Download CSV
-        </button>
-      </div>
-    </div>
-  );
-}
-
-// ------------------ Data Table ------------------
-interface DataTableProps {
-  rows: Record<string, string | number>[];
-}
-
-function DataTable({ rows }: DataTableProps) {
-  if (!rows?.length) return null;
-  const columns = Object.keys(rows[0]);
-  return (
-    <div style={styles.tableWrap}>
-      <table style={styles.table}>
+    <div style={{ overflowX: "auto" }}>
+      <table className="data-table">
         <thead>
-          <tr>
-            {columns.map((c) => (
-              <th key={c} style={styles.th}>
-                {c}
-              </th>
-            ))}
-          </tr>
+          <tr>{columns.map((c) => <th key={c}>{c}</th>)}</tr>
         </thead>
         <tbody>
           {rows.map((r, i) => (
             <tr key={i}>
-              {columns.map((c) => (
-                <td key={c} style={styles.td}>
-                  {String(r[c])}
-                </td>
-              ))}
+              {columns.map((c) => <td key={`${c}-${i}`}>{String(r[c] ?? "")}</td>)}
             </tr>
           ))}
         </tbody>
@@ -216,120 +60,237 @@ function DataTable({ rows }: DataTableProps) {
   );
 }
 
-// ------------------ Utilities ------------------
-function inferSchema(rows: Record<string, string | number>[]) {
-  if (!rows?.length) return { xKey: null, seriesKeys: [] };
-  const keys = Object.keys(rows[0]);
-  const numeric = keys.filter((k) => typeof rows[0][k] === "number");
-  const nonNumeric = keys.filter((k) => typeof rows[0][k] !== "number");
-  const xKey = nonNumeric[0] || keys[0];
-  const seriesKeys = numeric.length ? numeric : keys.filter((k) => k !== xKey);
-  return { xKey, seriesKeys };
+function ChartFromData({ rows, chartType }: { rows: TableRow[]; chartType?: string | null }) {
+  if (!rows || rows.length === 0) return null;
+
+  const cols = Object.keys(rows[0] ?? {});
+  const numericCols = cols.filter((c) =>
+    rows.every((r) => r[c] === null || r[c] === "" || !isNaN(Number(r[c])))
+  );
+  const xKey = cols.find((c) => !numericCols.includes(c)) ?? cols[0];
+  const yKeys = numericCols.filter((c) => c !== xKey);
+
+  let type = (chartType || "").toLowerCase();
+  if (!type) {
+    if (numericCols.length === 2 && numericCols.includes("x") && numericCols.includes("y")) type = "scatter";
+    else if (yKeys.length >= 2) type = "bar";
+    else type = "line";
+  }
+
+  if (yKeys.length === 0) {
+    return <div className="muted">Not enough numeric columns to render a chart.</div>;
+  }
+
+  // High-contrast palette and special-series styling
+  const palette = ["#2f81f7","#ef4444","#22c55e","#f59e0b","#a855f7","#14b8a6","#eab308","#f97316"];
+  const styleFor = (name: string, i: number) => {
+    const n = (name || "").toLowerCase();
+    if (n.includes("current")) return { stroke: "#ef4444", strokeWidth: 2.5 };
+    if (n.includes("avg") || n.includes("average")) return { stroke: "#9ca3af", strokeDasharray: "5 5", strokeWidth: 2 };
+    if (n.includes("sd")) return { stroke: "#cbd5e1", strokeDasharray: "4 6", strokeWidth: 2 };
+    return { stroke: palette[i % palette.length], strokeWidth: 2 };
+  };
+
+  return (
+    <div style={{ width: "100%", height: 320 }}>
+      <ResponsiveContainer>
+        {type === "scatter" ? (
+          <ScatterChart margin={{ top: 8, right: 16, bottom: 8, left: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" />
+            <XAxis dataKey={xKey === "x" ? "x" : xKey} tick={{ fill: "#cbd5e1" }} />
+            <YAxis dataKey={yKeys[0] ?? "y"} tick={{ fill: "#cbd5e1" }} />
+            <Tooltip />
+            <Legend />
+            <Scatter data={rows} />
+          </ScatterChart>
+        ) : type === "bar" || type === "stacked_bar" ? (
+          <BarChart data={rows} margin={{ top: 8, right: 16, bottom: 8, left: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" />
+            <XAxis dataKey={xKey} tick={{ fill: "#cbd5e1" }} />
+            <YAxis tick={{ fill: "#cbd5e1" }} />
+            <Tooltip />
+            <Legend />
+            {yKeys.map((k, i) => {
+              const s = styleFor(String(k), i);
+              return (
+                <Bar
+                  key={k}
+                  dataKey={k}
+                  stackId={type === "stacked_bar" ? "a" : undefined}
+                  fill={s.stroke}
+                />
+              );
+            })}
+          </BarChart>
+        ) : (
+          <LineChart data={rows} margin={{ top: 8, right: 16, bottom: 8, left: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" />
+            <XAxis dataKey={xKey} tick={{ fill: "#cbd5e1" }} />
+            <YAxis tick={{ fill: "#cbd5e1" }} />
+            <Tooltip />
+            <Legend />
+            {yKeys.map((k, i) => {
+              const s = styleFor(String(k), i);
+              return (
+                <Line
+                  key={k}
+                  type="monotone"
+                  dataKey={k}
+                  dot={false}
+                  stroke={s.stroke}
+                  strokeWidth={s.strokeWidth as number}
+                  strokeDasharray={s.strokeDasharray as string | undefined}
+                />
+              );
+            })}
+          </LineChart>
+        )}
+      </ResponsiveContainer>
+    </div>
+  );
 }
 
-function downloadCSV(rows: Record<string, string | number>[]) {
-  if (!rows?.length) return;
-  const cols = Object.keys(rows[0]);
-  const header = cols.join(",");
-  const lines = rows.map((r) => cols.map((c) => r[c]).join(","));
-  const csv = [header, ...lines].join("\n");
-  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = "extracted_table.csv";
-  a.click();
-  URL.revokeObjectURL(url);
-}
+export default function App() {
+  const [file, setFile] = useState<File | null>(null);
+  const [serverFilename, setServerFilename] = useState<string>("");
+  const [pageCount, setPageCount] = useState<number>(0);
+  const [thumbs, setThumbs] = useState<string[]>([]);
+  const [selectedPage, setSelectedPage] = useState<number | null>(null);
 
-// ------------------ Styles ------------------
-const styles: Record<string, React.CSSProperties> = {
-  page: {
-    minHeight: "100vh",
-    background: "#0f1115",
-    color: "#e5e7eb",
-    padding: "32px 24px",
-    fontFamily: "ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto",
-  },
-  header: { fontSize: 36, fontWeight: 800, marginBottom: 20 },
-  controls: {
-    display: "flex",
-    gap: 12,
-    alignItems: "center",
-    marginBottom: 20,
-  },
-  button: {
-    padding: "10px 16px",
-    borderRadius: 10,
-    background: "#2563eb",
-    color: "white",
-    border: "none",
-    fontWeight: 600,
-    cursor: "pointer",
-  },
-  secondaryBtn: {
-    padding: "8px 12px",
-    borderRadius: 8,
-    background: "#111827",
-    color: "#e5e7eb",
-    border: "1px solid #374151",
-    cursor: "pointer",
-  },
-  error: {
-    color: "#fecaca",
-    background: "#7f1d1d",
-    padding: 12,
-    borderRadius: 8,
-    marginBottom: 16,
-  },
-  notice: { opacity: 0.8 },
-  panel: { display: "grid", gap: 20 },
-  card: {
-    background: "#111827",
-    border: "1px solid #1f2937",
-    borderRadius: 16,
-    padding: 16,
-    boxShadow: "0 6px 24px rgba(0,0,0,0.25)",
-  },
-  cardTitle: { fontSize: 18, fontWeight: 700, marginBottom: 12 },
-  sideBySide: {
-    display: "grid",
-    gridTemplateColumns: "1fr 1.2fr",
-    gap: 16,
-    alignItems: "center",
-  },
-  figure: { margin: 0, textAlign: "center" },
-  img: { maxWidth: "100%", borderRadius: 12, border: "1px solid #374151" },
-  caption: { marginTop: 6, fontSize: 12, opacity: 0.8 },
-  chartWrap: { width: "100%", height: 340 },
-  tableWrap: { overflowX: "auto", marginTop: 16 },
-  table: {
-    width: "100%",
-    borderCollapse: "separate",
-    borderSpacing: 0,
-    border: "1px solid #1f2937",
-    borderRadius: 12,
-  },
-  th: {
-    textAlign: "left",
-    padding: "10px 12px",
-    background: "#0b1220",
-    borderBottom: "1px solid #1f2937",
-    position: "sticky",
-    top: 0,
-  },
-  td: {
-    padding: "10px 12px",
-    borderBottom: "1px solid #1f2937",
-  },
-  actions: { marginTop: 12, display: "flex", gap: 8 },
-  details: {
-    marginTop: 8,
-    background: "#0b1220",
-    border: "1px solid #1f2937",
-    borderRadius: 12,
-    padding: 12,
-  },
-  summary: { cursor: "pointer", fontWeight: 600 },
-  pre: { overflowX: "auto", whiteSpace: "pre-wrap", marginTop: 8 },
-};
+  const [result, setResult] = useState<ProcessData | null>(null);
+  const [uploading, setUploading] = useState<boolean>(false);
+  const [processing, setProcessing] = useState<boolean>(false);
+  const [error, setError] = useState<string>("");
+
+  const onFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0] ?? null;
+    setFile(f);
+    setServerFilename("");
+    setPageCount(0);
+    setThumbs([]);
+    setSelectedPage(null);
+    setResult(null);
+    setError("");
+  };
+
+  const handleUpload = async () => {
+    setError("");
+    if (!file) { setError("Choose a PDF first."); return; }
+    setUploading(true);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const res = await fetch(`${backend}/upload`, { method: "POST", body: fd });
+      const json = (await res.json()) as UploadResponse & { error?: string };
+      if (!res.ok) throw new Error(json.error || "Upload failed");
+      setServerFilename(json.filename);
+      setPageCount(json.page_count);
+      setThumbs(json.thumbnails);
+    } catch (e: any) {
+      setError(e?.message || "Upload failed");
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const processPage = async (page: number) => {
+    setError("");
+    if (!serverFilename) { setError("Upload a PDF first."); return; }
+    setProcessing(true);
+    setSelectedPage(page);
+    setResult(null);
+    try {
+      const fd = new FormData();
+      fd.append("filename", serverFilename);
+      fd.append("page_number", String(page));
+      const res = await fetch(`${backend}/process_page`, { method: "POST", body: fd });
+      const json = (await res.json()) as ProcessPageResponse & { error?: string };
+      if (!res.ok) throw new Error(json.error || "Processing failed");
+      setResult(json.data);
+    } catch (e: any) {
+      setError(e?.message || "Processing failed");
+    } finally {
+      setProcessing(false);
+    }
+  };
+
+  return (
+    <div className="container">
+      <h1>PDF Graph Extractor</h1>
+
+      <div className="panel">
+        <label className="file-picker">
+          <span>Choose PDF</span>
+          <input type="file" accept="application/pdf" onChange={onFileChange} />
+        </label>
+        <button onClick={handleUpload} disabled={uploading || !file}>
+          {uploading ? "Uploading..." : "Upload PDF"}
+        </button>
+      </div>
+
+      {error && <div className="error">{error}</div>}
+
+      {serverFilename && (
+        <div className="panel" style={{ display: "block" }}>
+          <div className="info" style={{ marginBottom: 12 }}>
+            <div>Uploaded: <strong>{serverFilename}</strong></div>
+            <div>Pages: <strong>{pageCount}</strong></div>
+          </div>
+          <div className="thumb-grid">
+            {thumbs.map((t, i) => (
+              <button
+                key={t}
+                onClick={() => processPage(i + 1)}
+                className={selectedPage === (i + 1) ? "thumb-btn active" : "thumb-btn"}
+                title={`Page ${i + 1}`}
+              >
+                <img
+                  src={urlWithBust(`${backend}/images/thumbs/${encodeURIComponent(t)}`)}
+                  alt={`Page ${i + 1}`}
+                />
+                <div className="thumb-caption">Page {i + 1}</div>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {processing && <div className="panel">Processing page {selectedPage}…</div>}
+
+      {result?.tables?.length ? (
+        <div className="results">
+          {result.tables.map((t, idx) => {
+            const cropUrl = urlWithBust(`${backend}/images/enhanced/${encodeURIComponent(t.image)}`);
+            return (
+              <div className="card" key={`${t.page}-${t.region}-${idx}`}>
+                <div className="card-header">
+                  <h3>Page {t.page} • Graph {t.region + 1}</h3>
+                </div>
+
+                <div className="row-2col">
+                  <div className="image-block">
+                    <div className="img-label">Cropped graph</div>
+                    <img src={cropUrl} alt="Cropped graph" />
+                    {t.chart_type ? <div className="muted" style={{ marginTop: 6 }}>Detected type: {t.chart_type}</div> : null}
+                    {t.note ? <div className="muted" style={{ marginTop: 6 }}>{t.note}</div> : null}
+                  </div>
+
+                  <div className="image-block">
+                    <div className="img-label">Remade from extracted data</div>
+                    <ChartFromData rows={t.data} chartType={t.chart_type} />
+                  </div>
+                </div>
+
+                <div className="table-block">
+                  <DataTable rows={t.data} />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        selectedPage && !processing && <div className="empty">No graphs detected or no tables parsed.</div>
+      )}
+    </div>
+  );
+}
