@@ -6,14 +6,14 @@ import csv
 import json
 import math
 import base64
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 
 import numpy as np
 import fitz  # PyMuPDF
 import cv2
 import pandas as pd
 from pdf2image import convert_from_path
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 import requests
 from dotenv import load_dotenv
 
@@ -40,6 +40,10 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         return default
 
+def _env_choice(name: str, choices: List[str], default: str) -> str:
+    v = (os.getenv(name) or "").strip().lower()
+    return v if v in choices else default
+
 # =============================
 # Config
 # =============================
@@ -52,12 +56,14 @@ OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "pdf-extractor")
 POPPLER_PATH = os.getenv("POPPLER_PATH") or None
 PDF_DPI = _env_int("PDF_DPI", 350)
 
-# small padding to ensure axes/ticks are included
+# Axis-aware padding (extra emphasis for typical charts so ticks/labels stay inside)
 REGION_PAD_LEFT_PCT   = _env_float("REGION_PAD_LEFT_PCT", 0.08)
 REGION_PAD_RIGHT_PCT  = _env_float("REGION_PAD_RIGHT_PCT", 0.06)
 REGION_PAD_TOP_PCT    = _env_float("REGION_PAD_TOP_PCT", 0.06)
 REGION_PAD_BOTTOM_PCT = _env_float("REGION_PAD_BOTTOM_PCT", 0.10)
 REGION_MIN_PAD_ABS_PX = _env_int("REGION_MIN_PAD_ABS_PX", 12)
+# axis bias for line/bar: add % to left/bottom pads
+AXIS_PAD_BOOST = _env_float("AXIS_PAD_BOOST", 0.04)
 
 UPSCALE_FACTOR = _env_float("UPSCALE_FACTOR", 1.0)  # keep 1.0 by default (no resize)
 
@@ -65,12 +71,19 @@ UPSCALE_FACTOR = _env_float("UPSCALE_FACTOR", 1.0)  # keep 1.0 by default (no re
 USE_UPSTAGE_DETECTOR = _env_bool("USE_UPSTAGE_DETECTOR", True)
 UPSTAGE_API_KEY = os.getenv("UPSTAGE_API_KEY", "")
 UPSTAGE_URL = os.getenv("UPSTAGE_URL", "https://api.upstage.ai/v1/document-digitization")
+UPSTAGE_MODEL = os.getenv("UPSTAGE_MODEL", "document-parse")
 UPSTAGE_FORCE_OCR = os.getenv("UPSTAGE_FORCE_OCR", "auto")  # "auto" or "force"
 
 # Filtering knobs
 PREFERRED_SERIES_RE = re.compile(os.getenv("PREFERRED_SERIES_REGEX", r"^(current|close|price|index|value|actual|series|y)$"), re.I)
 EXCLUDED_SERIES_RE  = re.compile(os.getenv("EXCLUDED_SERIES_REGEX", r"(^avg$|average|\+?\d+sd|\-?\d+sd|sd$|band|upper|lower|guide|benchmark|target)"), re.I)
 ONLY_ONE_SERIES     = os.getenv("ONLY_ONE_SERIES", "false").strip().lower() in ("1","true","yes","y","on")
+
+# Accuracy controls
+DEDUP_POLICY = _env_choice("DEDUP_POLICY", ["first", "last", "mean"], "first")
+VALIDATION_RETRY = _env_bool("VALIDATION_RETRY", True)
+DATE_PARSE_THRESHOLD = _env_float("DATE_PARSE_THRESHOLD", 0.6)  # % of X values that must parse as date to consider date-like
+NUMERIC_THRESHOLD = _env_float("NUMERIC_THRESHOLD", 0.85)       # % of values that must be numeric to consider a column numeric
 
 # =============================
 # Paths
@@ -115,6 +128,22 @@ def _to_number(v):
     if s in ("", "-", ".", "--"): return None
     try: return float(s)
     except: return None
+
+def _is_numeric_series(s: pd.Series) -> bool:
+    return s.apply(lambda x: _to_number(x) is not None).mean() >= NUMERIC_THRESHOLD
+
+def _tries_parse_date(x: Any) -> bool:
+    try:
+        pd.to_datetime(str(x), errors="raise", infer_datetime_format=True)
+        return True
+    except Exception:
+        return False
+
+def _date_like_fraction(col: pd.Series) -> float:
+    vals = col.dropna().astype(str).tolist()
+    if not vals: return 0.0
+    ok = sum(_tries_parse_date(v) for v in vals)
+    return ok / len(vals)
 
 # =============================
 # Page count + thumbnails
@@ -162,7 +191,8 @@ def load_page_image(pdf_path: str, page_number: int) -> Image.Image:
 # Enhance cropped image
 # =============================
 def enhance_image(image_path: str, output_dir: str = ENHANCED_DIR) -> str:
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True
+    )
     try:
         img = Image.open(image_path)
         if UPSCALE_FACTOR and abs(UPSCALE_FACTOR - 1.0) > 1e-6:
@@ -180,12 +210,20 @@ def enhance_image(image_path: str, output_dir: str = ENHANCED_DIR) -> str:
 # =============================
 # Boxes
 # =============================
-def expand_box(box, img_w, img_h):
+def expand_box(box, img_w, img_h, chart_type: Optional[str] = None):
     x, y, w, h = box["x"], box["y"], box["w"], box["h"]
-    pad_l = max(int(w * REGION_PAD_LEFT_PCT),   REGION_MIN_PAD_ABS_PX)
+
+    pad_l_pct = REGION_PAD_LEFT_PCT
+    pad_b_pct = REGION_PAD_BOTTOM_PCT
+    # bias left/bottom pads for line/bar to better capture axes/ticks
+    if chart_type in ("line", "bar"):
+        pad_l_pct += AXIS_PAD_BOOST
+        pad_b_pct += AXIS_PAD_BOOST
+
+    pad_l = max(int(w * pad_l_pct),   REGION_MIN_PAD_ABS_PX)
     pad_r = max(int(w * REGION_PAD_RIGHT_PCT),  REGION_MIN_PAD_ABS_PX)
     pad_t = max(int(h * REGION_PAD_TOP_PCT),    REGION_MIN_PAD_ABS_PX)
-    pad_b = max(int(h * REGION_PAD_BOTTOM_PCT), REGION_MIN_PAD_ABS_PX)
+    pad_b = max(int(h * pad_b_pct), REGION_MIN_PAD_ABS_PX)
     x0 = max(0, x - pad_l); y0 = max(0, y - pad_t)
     x1 = min(img_w, x + w + pad_r); y1 = min(img_h, y + h + pad_b)
     return {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0}
@@ -213,7 +251,7 @@ def upstage_parse_document(pdf_path: str) -> Optional[Dict[str, Any]]:
         headers = {"Authorization": f"Bearer {UPSTAGE_API_KEY}"}
         files = {"document": open(pdf_path, "rb")}
         data = {
-            "model": "document-parse",
+            "model": UPSTAGE_MODEL,
             "ocr": UPSTAGE_FORCE_OCR,                 # "auto" or "force"
             "output_formats": "['html']",
             "coordinates": "true"
@@ -386,14 +424,18 @@ def detect_regions(pdf_path: str, page_number: int, page_img_w: int, page_img_h:
         if up_json:
             regs = upstage_regions_for_page(up_json, page_number - 1, page_img_w, page_img_h)
             if regs:
-                # debug overlay
                 try:
                     _draw_overlay(pdf_path, page_number, regs)
                 except Exception:
                     pass
                 return regs
     print("Falling back to OpenCV regions.")
-    return detect_graph_regions_opencv(pdf_path, page_number)
+    regs = detect_graph_regions_opencv(pdf_path, page_number)
+    try:
+        _draw_overlay(pdf_path, page_number, regs)
+    except Exception:
+        pass
+    return regs
 
 def _draw_overlay(pdf_path: str, page_number: int, regions: List[Dict[str, Any]]):
     img = load_page_image(pdf_path, page_number).copy()
@@ -410,12 +452,35 @@ def _draw_overlay(pdf_path: str, page_number: int, regions: List[Dict[str, Any]]
 # =============================
 # LLM extraction via OpenRouter
 # =============================
+def _strict_rules(chart_type: Optional[str], want_dual: bool,
+                  y_left_label: Optional[str], y_right_label: Optional[str]) -> str:
+    # Hard, unambiguous instructions to reduce flips and weird headers
+    base = [
+        "You are converting a chart image into CSV for data analysis.",
+        "Return ONLY CSV. No commentary, no code fences, no extra rows.",
+        "X is always the horizontal axis (categories/dates). Y is always the vertical axis (numeric values). Do NOT swap axes.",
+        "All Y values must be pure numbers. Strip %, currency, commas, mn/bn suffixes.",
+        "Use the X-axis tick labels as the first column values.",
+    ]
+    if chart_type:
+        base.append(f"The original chart type is '{chart_type}'. Keep that orientation.")
+    if want_dual:
+        base.append("Output EXACTLY THREE columns: X,Y_left,Y_right (in that order).")
+        if y_left_label:  base.append(f"Left axis unit/label: {y_left_label}.")
+        if y_right_label: base.append(f"Right axis unit/label: {y_right_label}.")
+        base.append("If multiple series per axis, choose the primary series for each axis. Ignore averages, bands, guides, benchmarks.")
+    else:
+        base.append("Output EXACTLY TWO columns: X,Y (in that order).")
+        base.append("If multiple series exist, choose the most representative (Current/Price/Index). Ignore averages, bands, guides, benchmarks.")
+    return " ".join(base)
+
 def extract_csv_from_image(image_path: str, model: Optional[str] = None,
                            chart_type: Optional[str] = None,
                            series_hints: Optional[List[str]] = None,
                            want_dual: bool = False,
                            y_left_label: Optional[str] = None,
-                           y_right_label: Optional[str] = None) -> Optional[str]:
+                           y_right_label: Optional[str] = None,
+                           fixup_pass: bool = False) -> Optional[str]:
     if not OPENROUTER_API_KEY:
         print("Missing OPENROUTER_API_KEY")
         return None
@@ -431,35 +496,25 @@ def extract_csv_from_image(image_path: str, model: Optional[str] = None,
     with open(image_path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode("utf-8")
 
-    rules = [
-        "Use the X-axis tick labels as the first column header.",
-        "Strip %, currency, 'mn'/'bn', and commas from numbers: output pure numbers.",
-        "No commentary, no code fences, CSV only."
-    ]
-    if chart_type:
-        rules.insert(0, f"The original chart type is '{chart_type}'. Do not change chart type.")
-    if want_dual:
-        rules.insert(1, "Return CSV with EXACTLY THREE columns: X, Y_left (left axis), Y_right (right axis).")
-        if y_left_label:  rules.append(f"Left axis label (unit): {y_left_label}.")
-        if y_right_label: rules.append(f"Right axis label (unit): {y_right_label}.")
-        rules.append("If multiple series exist per axis, choose the primary series on each axis.")
-        rules.append("Ignore averages, bands, benchmarks, or ±SD guides.")
-    else:
-        rules.insert(1, "Return CSV with EXACTLY TWO columns: X and Y (primary series only).")
-        if series_hints:
-            rules.append("If multiple series exist, choose the most representative (e.g., Current/Price/Index).")
-        rules.append("Ignore averages, bands, benchmarks, or ±SD guides.")
+    rules_text = _strict_rules(chart_type, want_dual, y_left_label, y_right_label)
+    if fixup_pass:
+        # A short, targeted re-ask to correct mistakes
+        rules_text += " IMPORTANT: Previous attempt had schema/axis issues. Correct them strictly per instructions."
 
     payload = {
         "model": model_id,
+        "max_tokens": 400,
+        "temperature": 0.0,
         "messages": [{
             "role": "user",
             "content": [
-                {"type": "text", "text": " ".join(rules)},
+                {"type": "text", "text": rules_text},
                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
             ]
         }]
     }
+
+    print(f"[LLM] Using model: {model_id} (fallback={LLM_MODEL_FALLBACK}) for {os.path.basename(image_path)}")
 
     def call(p):
         try:
@@ -473,7 +528,15 @@ def extract_csv_from_image(image_path: str, model: Optional[str] = None,
             return None, resp
         try:
             j = resp.json()
-            content = j["choices"][0]["message"]["content"]
+            content = j["choices"][0]["message"].get("content")
+            # debug dump
+            try:
+                dbg_path = os.path.join(DEBUG_DIR, f"raw_{('fix_' if fixup_pass else '')}{os.path.basename(image_path)}.txt")
+                with open(dbg_path, "w", encoding="utf-8") as f:
+                    f.write(content or "")
+                print(f"[LLM] wrote raw to {dbg_path} (len={len(content or '')})")
+            except Exception:
+                pass
             return (content.strip() if content else None), resp
         except Exception:
             print("Unexpected LLM response:", resp.text[:300])
@@ -481,7 +544,6 @@ def extract_csv_from_image(image_path: str, model: Optional[str] = None,
 
     out, r = call(payload)
     if (not out) and LLM_MODEL_FALLBACK:
-        # retry on image-input unsupported / transient
         print(f"Retrying with fallback model: {LLM_MODEL_FALLBACK}")
         payload["model"] = LLM_MODEL_FALLBACK
         out, _ = call(payload)
@@ -516,105 +578,153 @@ def csv_to_df(raw_text: str) -> Optional[pd.DataFrame]:
         return None
 
 # =============================
-# X/Y selection (dual-axis aware)
+# Normalization / Validation
 # =============================
-def _pick_primary_y(y_cols, series_hints, df):
-    if not y_cols:
-        return None
-    y = [c for c in y_cols if not EXCLUDED_SERIES_RE.search(str(c))]
-    y = y or y_cols[:]
-    if series_hints:
-        norm = [h.strip().lower() for h in series_hints if isinstance(h,str)]
-        for c in y:
-            if str(c).strip().lower() in norm and PREFERRED_SERIES_RE.search(str(c)):
-                return c
-    for c in y:
-        if PREFERRED_SERIES_RE.search(str(c)):
-            return c
-    best_c, best_std = None, -1.0
-    for c in y:
-        s = pd.Series([_to_number(v) for v in df[c]]).dropna()
-        st = float(s.std()) if not s.empty else 0.0
-        if st > best_std:
-            best_c, best_std = c, st
-    return best_c or (y_cols[0] if y_cols else None)
+def _looks_date_like(s: pd.Series) -> bool:
+    return _date_like_fraction(s) >= DATE_PARSE_THRESHOLD
 
-def filter_df_to_axes(df: pd.DataFrame,
-                      series_hints: Optional[List[str]],
-                      axes_meta: Dict[str, Any],
-                      axis_map: Dict[str, set]) -> pd.DataFrame:
-    if df is None or df.empty: return df
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-
-    def is_numeric_col(c): 
-        return df[c].apply(lambda x: _to_number(x) is not None).mean() > 0.85
-    year_like = [c for c in df.columns if re.search(r"^(year|date|month|time)$", str(c), re.I)]
-    x_key = year_like[0] if year_like else None
-    if not x_key:
-        non_num = [c for c in df.columns if not is_numeric_col(c)]
-        x_key = non_num[0] if non_num else df.columns[0]
-
-    for c in df.columns:
-        if c != x_key:
-            df[c] = df[c].map(_to_number)
-
-    y_candidates = [c for c in df.columns if c != x_key]
-    left_pool  = [c for c in y_candidates if (str(c) in axis_map.get("left", set()) or not axis_map.get("right"))]
-    right_pool = [c for c in y_candidates if (str(c) in axis_map.get("right", set()))]
-
-    if not left_pool:
-        left_pool = [c for c in y_candidates if not EXCLUDED_SERIES_RE.search(str(c))]
-    if not right_pool and axes_meta.get("has_dual"):
-        right_pool = [c for c in y_candidates if not EXCLUDED_SERIES_RE.search(str(c)) and c not in left_pool]
-
-    y_left  = _pick_primary_y(left_pool,  series_hints, df) if left_pool else None
-    y_right = _pick_primary_y(right_pool, series_hints, df) if right_pool else None
-
-    keep = [x_key]
-    if y_left:  keep.append(y_left)
-    if axes_meta.get("has_dual") and y_right and y_right != y_left:
-        keep.append(y_right)
-
-    if ONLY_ONE_SERIES and len(keep) > 2:
-        keep = keep[:2]  # force single Y if desired
-
-    df = df[keep]
-
-    # rename Y columns for clarity
-    cols_map = {x_key: x_key}
-    if len(keep) >= 2:
-        cols_map[keep[1]] = axes_meta.get("y_left") or "Y_left"
-    if len(keep) == 3:
-        cols_map[keep[2]] = axes_meta.get("y_right") or "Y_right"
-    df = df.rename(columns=cols_map)
-
+def fix_axis_order(df: pd.DataFrame, chart_type: Optional[str]) -> Tuple[pd.DataFrame, bool]:
+    """
+    Heuristic to correct X/Y flips:
+    - Prefer X to be non-numeric or date-like categories; Y to be numeric.
+    - If first col is numeric and the second is non-numeric/date-like -> swap.
+    - For line/bar, if col1 looks like date/categories and col0 is numeric -> swap.
+    Returns: (df, swapped: bool)
+    """
     try:
-        x_num = df[x_key].map(_to_number)
-        if x_num.notna().sum() >= len(df) * 0.7:
-            df[x_key] = x_num
-            df = df.sort_values(by=x_key)
-    except:
+        cols = list(df.columns)
+        if len(cols) < 2:
+            return df, False
+        c0, c1 = cols[0], cols[1]
+        s0, s1 = df[c0], df[c1]
+        c0_num = _is_numeric_series(s0)
+        c1_num = _is_numeric_series(s1)
+        c0_date = _looks_date_like(s0.astype(str))
+        c1_date = _looks_date_like(s1.astype(str))
+
+        should_swap = False
+        # primary rule: X should not be numeric if Y is numeric
+        if c0_num and not c1_num:
+            should_swap = True
+        # date hint: for line/bar charts, X is commonly dates/categories
+        if chart_type in ("line", "bar"):
+            if (c1_date and not c0_date) or (not c0_num and c1_num):
+                should_swap = True
+
+        if should_swap:
+            df = df[[c1, c0] + cols[2:]]
+            return df, True
+    except Exception:
         pass
+    return df, False
+
+def force_headers(df: pd.DataFrame, want_dual: bool, axes_meta: Dict[str, Any]) -> pd.DataFrame:
+    cols = list(df.columns)
+    if want_dual:
+        # canon: X, Y_left, Y_right
+        new_cols = ["X"]
+        if len(cols) >= 2:
+            new_cols.append("Y_left")
+        if len(cols) >= 3:
+            new_cols.append("Y_right")
+        new_cols += cols[len(new_cols):]  # append any extras just in case
+        df.columns = new_cols[:len(cols)]
+    else:
+        # canon: X, Y
+        new_cols = ["X"]
+        if len(cols) >= 2:
+            new_cols.append("Y")
+        new_cols += cols[len(new_cols):]
+        df.columns = new_cols[:len(cols)]
     return df
 
-def fix_headers(df: pd.DataFrame) -> pd.DataFrame:
+def coerce_numeric_y(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for c in out.columns[1:]:
+        out[c] = out[c].map(_to_number)
+    return out
+
+def sort_by_x(df: pd.DataFrame) -> pd.DataFrame:
+    x = df["X"]
+    # try numeric then date
+    try:
+        xn = x.map(_to_number)
+        if xn.notna().mean() >= 0.7:
+            out = df.copy()
+            out["X"] = xn
+            return out.sort_values("X")
+    except Exception:
+        pass
+    try:
+        xd = pd.to_datetime(x, errors="coerce", infer_datetime_format=True)
+        if xd.notna().mean() >= 0.7:
+            out = df.copy()
+            out["X"] = xd.dt.strftime("%Y-%m-%d")
+            return out.sort_values("X")
+    except Exception:
+        pass
+    # fallback: lexical
+    return df.sort_values("X")
+
+def dedup_by_x(df: pd.DataFrame, want_dual: bool) -> Tuple[pd.DataFrame, int]:
+    """
+    Ensure one Y per X using DEDUP_POLICY.
+    Returns: (df_deduped, dropped_rows)
+    """
+    if df.empty or "X" not in df.columns:
+        return df, 0
+    before = len(df)
+    if DEDUP_POLICY == "first":
+        df2 = df.drop_duplicates(subset=["X"], keep="first")
+    elif DEDUP_POLICY == "last":
+        df2 = df.drop_duplicates(subset=["X"], keep="last")
+    else:  # mean
+        # Aggregate numeric columns by mean; keep first X ordering
+        aggs = {c: "mean" for c in df.columns if c != "X"}
+        df2 = df.groupby("X", as_index=False).agg(aggs)
+    return df2, before - len(df2)
+
+def validate_dataframe(df: pd.DataFrame, want_dual: bool) -> Tuple[bool, List[str]]:
+    issues = []
     cols = list(df.columns)
-    if any((c is None) or (str(c).strip() == "") or str(c).lower().startswith("unnamed") for c in cols):
-        new_cols = []
-        y_idx = 1
-        for i, c in enumerate(cols):
-            s = "" if c is None else str(c).strip()
-            if i == 0 and s and not s.lower().startswith("unnamed"):
-                new_cols.append(s); continue
-            if s == "" or s.lower().startswith("unnamed"):
-                if i == 0: new_cols.append("X")
-                else:
-                    new_cols.append(f"Y{y_idx}"); y_idx += 1
-            else:
-                new_cols.append(s)
-        df.columns = new_cols
-    return df
+
+    # column count
+    expected = 3 if want_dual else 2
+    if len(cols) < expected:
+        issues.append(f"expected {expected} columns, got {len(cols)}")
+
+    # required headers
+    need = ["X", "Y_left", "Y_right"] if want_dual else ["X", "Y"]
+    for h in need:
+        if h not in cols:
+            issues.append(f"missing column '{h}'")
+
+    # numeric Y
+    for c in (["Y"] if not want_dual else ["Y_left", "Y_right"]):
+        if c in df.columns:
+            if not _is_numeric_series(df[c]):
+                issues.append(f"non-numeric values in {c}")
+
+    # X uniqueness
+    if "X" in df.columns:
+        dups = df["X"].duplicated().sum()
+        if dups > 0:
+            issues.append(f"{dups} duplicate X values")
+
+    return (len(issues) == 0), issues
+
+def pretty_headers(df: pd.DataFrame, axes_meta: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Return a mapping for pretty display names while keeping canonical keys.
+    """
+    pretty = {"X": "X"}
+    if "Y" in df.columns:
+        pretty["Y"] = axes_meta.get("y_left") or "Y"
+    if "Y_left" in df.columns:
+        pretty["Y_left"] = axes_meta.get("y_left") or "Y_left"
+    if "Y_right" in df.columns:
+        pretty["Y_right"] = axes_meta.get("y_right") or "Y_right"
+    return pretty
 
 # =============================
 # Page pipeline
@@ -626,60 +736,153 @@ def process_pdf_page(pdf_path: str, page_number: int) -> Dict[str, Any]:
         page_w, page_h = page_img.width, page_img.height
 
         regions = detect_regions(pdf_path, page_number, page_w, page_h)
-        print(f"Using {len(regions)} region(s) on page {page_number}")
+        if not regions:
+            print(f"[WARN] No regions detected on page {page_number}. Check UPSTAGE_API_KEY or OpenCV thresholds.")
+        else:
+            print(f"Using {len(regions)} region(s) on page {page_number}")
 
         results: List[Dict[str, Any]] = []
         debug_raw: List[Dict[str, Any]] = []
 
         for idx, r in enumerate(regions):
-            # Tight crop from Upstage, plus small padding for axes
-            exp = expand_box(r, page_w, page_h)
+            chart_type = r.get("chart_type")
+            axes_meta = r.get("axes") or {"y_left": None, "y_right": None, "has_dual": False}
+            axis_map  = r.get("axis_map") or {"left": set(), "right": set()}
+            want_dual = bool(axes_meta.get("has_dual"))
+
+            # Crop with axis-biased padding
+            exp = expand_box(r, page_w, page_h, chart_type=chart_type)
             crop = page_img.crop((exp["x"], exp["y"], exp["x"] + exp["w"], exp["y"] + exp["h"]))
             crop_name = f"page_{page_number}_region_{idx}_{run_id}_crop.png"
             crop_path = os.path.join(TEMP_DIR, crop_name)
             crop.save(crop_path, "PNG")
             display_path = enhance_image(crop_path, ENHANCED_DIR)
 
-            axes_meta = r.get("axes") or {"y_left": None,"y_right": None,"has_dual": False}
-            axis_map  = r.get("axis_map") or {"left": set(), "right": set()}
-            want_dual = bool(axes_meta.get("has_dual"))
-
+            # --- LLM pass 1
             raw = extract_csv_from_image(
                 display_path,
-                chart_type=r.get("chart_type"),
+                chart_type=chart_type,
                 series_hints=r.get("series_hints"),
                 want_dual=want_dual,
                 y_left_label=axes_meta.get("y_left"),
                 y_right_label=axes_meta.get("y_right"),
+                fixup_pass=False
             )
-            debug_raw.append({
+
+            debug_entry = {
                 "page": page_number,
                 "image": os.path.basename(display_path),
                 "raw": (raw or "")[:1000]
-            })
+            }
 
+            # Parse + normalize
             records = []
-            note = None
-            if raw:
-                df = csv_to_df(raw)
-                if df is not None:
-                    df = filter_df_to_axes(df, r.get("series_hints"), axes_meta, axis_map)
-                    df = fix_headers(df)
-                    df = df.replace([np.inf, -np.inf], np.nan)
-                    df = df.where(pd.notnull(df), None)
-                    records = deep_sanitize(df.to_dict(orient="records"))
+            note_parts: List[str] = []
+            confidence = "high"
+            swapped = False
+            rows_dropped = 0
+            validated_ok = False
+
+            def postprocess(raw_text: Optional[str]) -> Tuple[Optional[pd.DataFrame], List[str], bool, int, bool]:
+                notes = []
+                if not raw_text:
+                    notes.append("No model output.")
+                    return None, notes, False, 0, False
+                df = csv_to_df(raw_text)
+                if df is None:
+                    notes.append("Parsed CSV empty or invalid.")
+                    return None, notes, False, 0, False
+
+                # Trim to first N columns (avoid any model leakage)
+                df = df.iloc[:, : (3 if want_dual else 2)]
+
+                # Attempt X/Y normalization
+                df, swapped_here = fix_axis_order(df, chart_type)
+                if swapped_here:
+                    notes.append("Auto-corrected flipped X/Y.")
+                df = force_headers(df, want_dual, axes_meta)
+                df = coerce_numeric_y(df)
+                df = sort_by_x(df)
+
+                # Dedup X
+                df, dropped = dedup_by_x(df, want_dual)
+                if dropped > 0:
+                    notes.append(f"Deduplicated X ({dropped} rows dropped via policy '{DEDUP_POLICY}').")
+
+                # Remove rows with null Y
+                if want_dual:
+                    before = len(df)
+                    df = df[~(df["Y_left"].isna() & df["Y_right"].isna())]
+                    null_drop = before - len(df)
+                    if null_drop > 0:
+                        notes.append(f"Dropped {null_drop} rows with null Y values.")
                 else:
-                    note = "Parsed CSV empty or invalid."
+                    before = len(df)
+                    df = df[~df["Y"].isna()]
+                    null_drop = before - len(df)
+                    if null_drop > 0:
+                        notes.append(f"Dropped {null_drop} rows with null Y values.")
+
+                # Final validation
+                ok, issues = validate_dataframe(df, want_dual)
+                if not ok:
+                    notes.append("Validation issues: " + "; ".join(issues))
+                return df, notes, swapped_here, dropped + (null_drop if 'null_drop' in locals() else 0), ok
+
+            df, notes1, swapped1, dropped1, ok1 = postprocess(raw)
+
+            # If validation failed, optionally re-ask once
+            if (not ok1) and VALIDATION_RETRY:
+                raw_fix = extract_csv_from_image(
+                    display_path,
+                    chart_type=chart_type,
+                    series_hints=r.get("series_hints"),
+                    want_dual=want_dual,
+                    y_left_label=axes_meta.get("y_left"),
+                    y_right_label=axes_meta.get("y_right"),
+                    fixup_pass=True
+                )
+                debug_entry["raw_fix"] = (raw_fix or "")[:1000]
+                df2, notes2, swapped2, dropped2, ok2 = postprocess(raw_fix)
+                # choose the better of the two
+                if ok2 or (df2 is not None and (df is None or len(df2) >= len(df))):
+                    df, notes1, swapped1, dropped1, ok1 = df2, notes2, swapped2, dropped2, ok2
+
+            debug_raw.append(debug_entry)
+
+            if df is not None:
+                swapped = swapped1
+                rows_dropped = dropped1
+                validated_ok = ok1
+                # compute confidence
+                if not validated_ok:
+                    confidence = "low"
+                elif swapped or rows_dropped > 0:
+                    confidence = "medium"
+                else:
+                    confidence = "high"
+
+                # Prepare records for API
+                pretty_map = pretty_headers(df, axes_meta)
+                df_out = df.copy()
+                # we keep canonical keys in data; frontend can choose to show pretty labels if desired
+                df_out = df_out.replace([np.inf, -np.inf], np.nan).where(pd.notnull(df_out), None)
+                records = deep_sanitize(df_out.to_dict(orient="records"))
+                note_parts.extend(notes1)
+                if confidence != "high":
+                    note_parts.append(f"confidence={confidence}")
             else:
-                note = "No model output."
+                confidence = "low"
+                note_parts.extend(notes1)
 
             results.append({
                 "page": page_number,
                 "region": idx,
                 "image": os.path.basename(display_path),
                 "data": records,
-                "note": note,
-                "chart_type": r.get("chart_type"),
+                "note": ("; ".join(note_parts)) or None,
+                "confidence": confidence,
+                "chart_type": chart_type,
                 "category": r.get("category"),
                 "series_hints": r.get("series_hints"),
             })
