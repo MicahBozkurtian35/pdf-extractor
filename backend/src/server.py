@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from pdf_to_excel import (
+from PDF_Data_Extract import (
     UPLOAD_DIR, THUMB_DIR, ENHANCED_DIR,
     get_pdf_page_count, generate_page_thumbnail, process_pdf_page
 )
