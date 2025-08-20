@@ -1,26 +1,28 @@
 import React, { useState } from "react";
 import "./App.css";
 import {
-  LineChart, Line, CartesianGrid, XAxis, YAxis, Tooltip, Legend, ResponsiveContainer,
-  BarChart, Bar, ScatterChart, Scatter
+  ResponsiveContainer,
+  ComposedChart, Bar, Line, CartesianGrid, XAxis, YAxis, Tooltip, Legend,
+  LineChart, BarChart, ScatterChart, Scatter
 } from "recharts";
 
 type Scalar = string | number | boolean | null;
 
+interface SeriesMeta { name?: string; axis?: "left" | "right" | "none"; render?: "bar" | "line" | "area" | string; }
 interface TableRow { [key: string]: Scalar; }
-
 interface TableEntry {
   page: number;
   region: number;
-  image: string;         // enhanced crop filename from backend
-  data: TableRow[];      // parsed table/series rows
+  image?: string;
+  data: TableRow[];
   note?: string | null;
-  chart_type?: string | null;   // "line" | "bar" | "stacked_bar" | "scatter" | ...
+  chart_type?: string | null;
   category?: string | null;
-  series_hints?: string[];      // optional, may be undefined
+  series_hints?: string[];
+  confidence?: "low" | "medium" | "high";
+  series_meta?: SeriesMeta[]; // from backend
 }
-
-interface DebugEntry { page: number; image: string; raw: string; }
+interface DebugEntry { page: number; image?: string; raw?: string; raw_fix?: string; }
 interface ProcessData { tables: TableEntry[]; debug_raw: DebugEntry[]; }
 
 interface UploadResponse {
@@ -29,7 +31,6 @@ interface UploadResponse {
   page_count: number;
   thumbnails: string[];
 }
-
 interface ProcessPageResponse { message: string; data: ProcessData; }
 
 const backend = (import.meta as any).env?.VITE_BACKEND_URL || "http://localhost:5000";
@@ -41,6 +42,7 @@ function urlWithBust(path: string) {
 
 function DataTable({ rows }: { rows: TableRow[] }) {
   if (!rows || rows.length === 0) return <div className="muted">No data</div>;
+  // Preserve backend column order; 'X' should be first
   const columns = Object.keys(rows[0] ?? {});
   return (
     <div style={{ overflowX: "auto" }}>
@@ -60,67 +62,79 @@ function DataTable({ rows }: { rows: TableRow[] }) {
   );
 }
 
-function ChartFromData({ rows, chartType }: { rows: TableRow[]; chartType?: string | null }) {
+function ChartFromData({ rows, chartType, seriesMeta }: { rows: TableRow[]; chartType?: string | null; seriesMeta?: SeriesMeta[] }) {
   if (!rows || rows.length === 0) return null;
 
   const cols = Object.keys(rows[0] ?? {});
-  const numericCols = cols.filter((c) =>
-    rows.every((r) => r[c] === null || r[c] === "" || !isNaN(Number(r[c])))
-  );
-  const xKey = cols.find((c) => !numericCols.includes(c)) ?? cols[0];
-  const yKeys = numericCols.filter((c) => c !== xKey);
+  const xKey = cols.includes("X") ? "X" : (cols.find(c => rows.some(r => isNaN(Number(r[c])))) || cols[0]);
 
-  let type = (chartType || "").toLowerCase();
-  if (!type) {
-    if (numericCols.length === 2 && numericCols.includes("x") && numericCols.includes("y")) type = "scatter";
-    else if (yKeys.length >= 2) type = "bar";
-    else type = "line";
+  // numeric columns (excluding X)
+  const numericCols = cols.filter((c) =>
+    c !== xKey && rows.every((r) => r[c] === null || r[c] === "" || !isNaN(Number(r[c])))
+  );
+
+  const meta = (seriesMeta || []).filter(m => m && m.name && numericCols.includes(String(m.name)));
+  const useComposed =
+    meta.length > 0 ||
+    (chartType || "").toLowerCase() === "dual_axis" ||
+    (chartType || "").toLowerCase() === "combo";
+
+  const palette = ["#2f81f7","#ef4444","#22c55e","#f59e0b","#a855f7","#14b8a6","#eab308","#f97316"];
+  const colorFor = (name: string, i: number) => palette[i % palette.length];
+
+  if (useComposed) {
+    // If no meta is present, default first series to bar, rest to line on left axis
+    const completeMeta: SeriesMeta[] = meta.length
+      ? meta
+      : numericCols.map((n, i) => ({ name: n, axis: "left", render: i === 0 ? "bar" : "line" }));
+
+    const anyRight = completeMeta.some(m => (m.axis || "left") === "right");
+    return (
+      <div style={{ width: "100%", height: 320 }}>
+        <ResponsiveContainer>
+          <ComposedChart data={rows} margin={{ top: 8, right: 16, bottom: 8, left: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" />
+            <XAxis dataKey={xKey} tick={{ fill: "#cbd5e1" }} />
+            <YAxis yAxisId="left" tick={{ fill: "#cbd5e1" }} />
+            {anyRight && <YAxis yAxisId="right" orientation="right" tick={{ fill: "#cbd5e1" }} />}
+            <Tooltip />
+            <Legend />
+            {completeMeta.map((m, i) => {
+              const key = String(m.name);
+              const axisId = (m.axis || "left") === "right" ? "right" : "left";
+              const color = colorFor(key, i);
+              const render = (m.render || "line").toLowerCase();
+              if (render === "bar") {
+                return <Bar key={key} yAxisId={axisId} dataKey={key} fill={color} />;
+              }
+              return <Line key={key} yAxisId={axisId} type="monotone" dataKey={key} stroke={color} dot={false} strokeWidth={2} />;
+            })}
+          </ComposedChart>
+        </ResponsiveContainer>
+      </div>
+    );
   }
 
+  // Fallbacks (non-meta)
+  const yKeys = numericCols;
   if (yKeys.length === 0) {
     return <div className="muted">Not enough numeric columns to render a chart.</div>;
   }
 
-  // High-contrast palette and special-series styling
-  const palette = ["#2f81f7","#ef4444","#22c55e","#f59e0b","#a855f7","#14b8a6","#eab308","#f97316"];
-  const styleFor = (name: string, i: number) => {
-    const n = (name || "").toLowerCase();
-    if (n.includes("current")) return { stroke: "#ef4444", strokeWidth: 2.5 };
-    if (n.includes("avg") || n.includes("average")) return { stroke: "#9ca3af", strokeDasharray: "5 5", strokeWidth: 2 };
-    if (n.includes("sd")) return { stroke: "#cbd5e1", strokeDasharray: "4 6", strokeWidth: 2 };
-    return { stroke: palette[i % palette.length], strokeWidth: 2 };
-  };
+  let type = (chartType || "").toLowerCase();
+  if (!type) type = yKeys.length >= 2 ? "bar" : "line";
 
   return (
     <div style={{ width: "100%", height: 320 }}>
       <ResponsiveContainer>
-        {type === "scatter" ? (
-          <ScatterChart margin={{ top: 8, right: 16, bottom: 8, left: 0 }}>
-            <CartesianGrid strokeDasharray="3 3" />
-            <XAxis dataKey={xKey === "x" ? "x" : xKey} tick={{ fill: "#cbd5e1" }} />
-            <YAxis dataKey={yKeys[0] ?? "y"} tick={{ fill: "#cbd5e1" }} />
-            <Tooltip />
-            <Legend />
-            <Scatter data={rows} />
-          </ScatterChart>
-        ) : type === "bar" || type === "stacked_bar" ? (
+        {type === "bar" ? (
           <BarChart data={rows} margin={{ top: 8, right: 16, bottom: 8, left: 0 }}>
             <CartesianGrid strokeDasharray="3 3" />
             <XAxis dataKey={xKey} tick={{ fill: "#cbd5e1" }} />
             <YAxis tick={{ fill: "#cbd5e1" }} />
             <Tooltip />
             <Legend />
-            {yKeys.map((k, i) => {
-              const s = styleFor(String(k), i);
-              return (
-                <Bar
-                  key={k}
-                  dataKey={k}
-                  stackId={type === "stacked_bar" ? "a" : undefined}
-                  fill={s.stroke}
-                />
-              );
-            })}
+            {yKeys.map((k, i) => <Bar key={k} dataKey={k} fill={colorFor(k, i)} />)}
           </BarChart>
         ) : (
           <LineChart data={rows} margin={{ top: 8, right: 16, bottom: 8, left: 0 }}>
@@ -129,20 +143,7 @@ function ChartFromData({ rows, chartType }: { rows: TableRow[]; chartType?: stri
             <YAxis tick={{ fill: "#cbd5e1" }} />
             <Tooltip />
             <Legend />
-            {yKeys.map((k, i) => {
-              const s = styleFor(String(k), i);
-              return (
-                <Line
-                  key={k}
-                  type="monotone"
-                  dataKey={k}
-                  dot={false}
-                  stroke={s.stroke}
-                  strokeWidth={s.strokeWidth as number}
-                  strokeDasharray={s.strokeDasharray as string | undefined}
-                />
-              );
-            })}
+            {yKeys.map((k, i) => <Line key={k} type="monotone" dataKey={k} dot={false} stroke={colorFor(k, i)} strokeWidth={2} />)}
           </LineChart>
         )}
       </ResponsiveContainer>
@@ -200,13 +201,22 @@ export default function App() {
     setSelectedPage(page);
     setResult(null);
     try {
-      const fd = new FormData();
-      fd.append("filename", serverFilename);
-      fd.append("page_number", String(page));
-      const res = await fetch(`${backend}/process_page`, { method: "POST", body: fd });
+      const res = await fetch(`${backend}/process_page`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filename: serverFilename, page })
+      });
       const json = (await res.json()) as ProcessPageResponse & { error?: string };
       if (!res.ok) throw new Error(json.error || "Processing failed");
-      setResult(json.data);
+
+      const sorted = {
+        ...json.data,
+        tables: [...(json.data?.tables ?? [])].sort((a, b) =>
+          a.page !== b.page ? a.page - b.page : a.region - b.region
+        )
+      } as ProcessData;
+
+      setResult(sorted);
     } catch (e: any) {
       setError(e?.message || "Processing failed");
     } finally {
@@ -245,7 +255,7 @@ export default function App() {
                 title={`Page ${i + 1}`}
               >
                 <img
-                  src={urlWithBust(`${backend}/images/thumbs/${encodeURIComponent(t)}`)}
+                  src={urlWithBust(`${backend}/thumbnail/${encodeURIComponent(t)}`)}
                   alt={`Page ${i + 1}`}
                 />
                 <div className="thumb-caption">Page {i + 1}</div>
@@ -260,24 +270,27 @@ export default function App() {
       {result?.tables?.length ? (
         <div className="results">
           {result.tables.map((t, idx) => {
-            const cropUrl = urlWithBust(`${backend}/images/enhanced/${encodeURIComponent(t.image)}`);
+            const cropUrl = t.image ? urlWithBust(`${backend}/images/enhanced/${encodeURIComponent(t.image)}`) : "";
             return (
               <div className="card" key={`${t.page}-${t.region}-${idx}`}>
                 <div className="card-header">
-                  <h3>Page {t.page} • Graph {t.region + 1}</h3>
+                  <h3>
+                    Page {t.page} • Graph {t.region + 1}
+                    {t.chart_type ? <span className="muted" style={{ marginLeft: 10 }}>({t.chart_type})</span> : null}
+                    {t.confidence ? <span className="muted" style={{ marginLeft: 10 }}>confidence: {t.confidence}</span> : null}
+                  </h3>
                 </div>
 
                 <div className="row-2col">
                   <div className="image-block">
                     <div className="img-label">Cropped graph</div>
-                    <img src={cropUrl} alt="Cropped graph" />
-                    {t.chart_type ? <div className="muted" style={{ marginTop: 6 }}>Detected type: {t.chart_type}</div> : null}
+                    {cropUrl ? <img src={cropUrl} alt="Cropped graph" /> : <div className="muted">No crop preview</div>}
                     {t.note ? <div className="muted" style={{ marginTop: 6 }}>{t.note}</div> : null}
                   </div>
 
                   <div className="image-block">
                     <div className="img-label">Remade from extracted data</div>
-                    <ChartFromData rows={t.data} chartType={t.chart_type} />
+                    <ChartFromData rows={t.data} chartType={t.chart_type} seriesMeta={t.series_meta} />
                   </div>
                 </div>
 
